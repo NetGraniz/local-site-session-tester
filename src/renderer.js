@@ -12,7 +12,12 @@ const runStateText = document.querySelector('#runStateText');
 const sessionRows = document.querySelector('#sessionRows');
 const recordCount = document.querySelector('#recordCount');
 const logOutput = document.querySelector('#logOutput');
+const repeatOptions = document.querySelector('#repeatOptions');
+const maxCyclesField = document.querySelector('#maxCyclesField');
+const infiniteWarning = document.querySelector('#infiniteWarning');
 const fields = [...form.querySelectorAll('input, select')];
+
+let isRunning = false;
 
 const elements = {
   url: document.querySelector('#url'),
@@ -22,7 +27,12 @@ const elements = {
   navigationTimeoutMs: document.querySelector('#navigationTimeoutMs'),
   headless: document.querySelector('#headless'),
   viewportWidth: document.querySelector('#viewportWidth'),
-  viewportHeight: document.querySelector('#viewportHeight')
+  viewportHeight: document.querySelector('#viewportHeight'),
+  repeatEnabled: document.querySelector('#repeatEnabled'),
+  repeatMode: document.querySelector('#repeatMode'),
+  maxCycles: document.querySelector('#maxCycles'),
+  restartDelayMs: document.querySelector('#restartDelayMs'),
+  stopSlotOnError: document.querySelector('#stopSlotOnError')
 };
 
 const statElements = {
@@ -30,14 +40,34 @@ const statElements = {
   started: document.querySelector('#statStarted'),
   active: document.querySelector('#statActive'),
   completed: document.querySelector('#statCompleted'),
-  errors: document.querySelector('#statErrors'),
   stopped: document.querySelector('#statStopped'),
-  averageLoadMs: document.querySelector('#statAverage')
+  averageLoadMs: document.querySelector('#statAverage'),
+  totalCycles: document.querySelector('#statTotalCycles'),
+  currentCycle: document.querySelector('#statCurrentCycle'),
+  restarted: document.querySelector('#statRestarted'),
+  errorCycles: document.querySelector('#statErrorCycles'),
+  cyclesPerMinute: document.querySelector('#statCyclesPerMinute')
 };
 
 const sessions = new Map();
 
+function updateRepeatControls() {
+  const repeatEnabled = elements.repeatEnabled.checked;
+  const limited = repeatEnabled && elements.repeatMode.value === 'limited';
+  repeatOptions.hidden = !repeatEnabled;
+  maxCyclesField.hidden = !limited;
+  infiniteWarning.hidden = !(repeatEnabled && elements.repeatMode.value === 'unlimited');
+
+  if (!isRunning) {
+    elements.repeatMode.disabled = !repeatEnabled;
+    elements.restartDelayMs.disabled = !repeatEnabled;
+    elements.stopSlotOnError.disabled = !repeatEnabled;
+    elements.maxCycles.disabled = !limited;
+  }
+}
+
 function setRunning(running, label) {
+  isRunning = running;
   fields.forEach((field) => {
     field.disabled = running;
   });
@@ -45,6 +75,7 @@ function setRunning(running, label) {
   stopButton.disabled = !running;
   runState.classList.toggle('is-active', running);
   runStateText.textContent = label || (running ? 'Тест выполняется' : 'Готово к запуску');
+  if (!running) updateRepeatControls();
 }
 
 function showValidation(message) {
@@ -54,12 +85,15 @@ function showValidation(message) {
 
 function populateSettings(settings) {
   for (const [key, element] of Object.entries(elements)) {
-    if (key === 'headless') {
+    if (element.type === 'checkbox') {
+      element.checked = Boolean(settings[key]);
+    } else if (key === 'headless') {
       element.value = String(settings[key]);
     } else {
       element.value = settings[key] ?? '';
     }
   }
+  updateRepeatControls();
 }
 
 function collectSettings() {
@@ -71,7 +105,12 @@ function collectSettings() {
     navigationTimeoutMs: Number(elements.navigationTimeoutMs.value),
     headless: elements.headless.value === 'true',
     viewportWidth: Number(elements.viewportWidth.value),
-    viewportHeight: Number(elements.viewportHeight.value)
+    viewportHeight: Number(elements.viewportHeight.value),
+    repeatEnabled: elements.repeatEnabled.checked,
+    repeatMode: elements.repeatMode.value,
+    maxCycles: Number(elements.maxCycles.value),
+    restartDelayMs: Number(elements.restartDelayMs.value),
+    stopSlotOnError: elements.stopSlotOnError.checked
   };
 }
 
@@ -88,6 +127,10 @@ function validateLocally(settings) {
   if (!form.checkValidity()) {
     form.reportValidity();
     return 'Проверьте числовые параметры теста.';
+  }
+  if (settings.repeatEnabled && settings.repeatMode === 'limited'
+      && (!Number.isInteger(settings.maxCycles) || settings.maxCycles < 1 || settings.maxCycles > 100000)) {
+    return 'Количество циклов на слот должно быть от 1 до 100000.';
   }
   return '';
 }
@@ -114,14 +157,14 @@ function createCell(text, className = '') {
 
 function renderSessions() {
   sessionRows.replaceChildren();
-  const ordered = [...sessions.values()].sort((a, b) => a.number - b.number);
-  recordCount.textContent = `${ordered.length} ${ordered.length === 1 ? 'запись' : ordered.length < 5 ? 'записи' : 'записей'}`;
+  const ordered = [...sessions.values()].sort((a, b) => a.slotId - b.slotId);
+  recordCount.textContent = `${ordered.length} ${ordered.length === 1 ? 'слот' : ordered.length < 5 ? 'слота' : 'слотов'}`;
 
   if (!ordered.length) {
     const row = document.createElement('tr');
     row.className = 'empty-row';
     const cell = createCell('Сессии появятся после запуска теста');
-    cell.colSpan = 6;
+    cell.colSpan = 9;
     row.append(cell);
     sessionRows.append(row);
     return;
@@ -130,14 +173,16 @@ function renderSessions() {
   const fragment = document.createDocumentFragment();
   for (const session of ordered) {
     const row = document.createElement('tr');
-    const numberCell = createCell(String(session.number), 'session-number');
     const statusCell = document.createElement('td');
     const badge = document.createElement('span');
     badge.className = `status-badge ${statusClass(session.status)}`;
     badge.textContent = session.status;
     statusCell.append(badge);
     row.append(
-      numberCell,
+      createCell(String(session.slotId), 'session-number'),
+      createCell(session.cycle || '—', 'mono'),
+      createCell(session.runId || '—', 'mono run-id'),
+      createCell(String(session.restartCount || 0), 'mono'),
       statusCell,
       createCell(session.httpStatus ?? '—', 'mono'),
       createCell(session.loadTimeMs === null ? '—' : `${session.loadTimeMs} мс`, 'mono'),
@@ -180,7 +225,7 @@ function appendLog(entry) {
 function loadState(state) {
   populateSettings(state.settings);
   sessions.clear();
-  for (const session of state.sessions || []) sessions.set(session.number, session);
+  for (const session of state.sessions || []) sessions.set(session.slotId, session);
   renderSessions();
   renderStatistics(state.statistics || {});
   setRunning(Boolean(state.running));
@@ -235,9 +280,12 @@ openLogsButton.addEventListener('click', async () => {
   if (!result.ok) showValidation(`Не удалось открыть папку журналов: ${result.error}`);
 });
 
+elements.repeatEnabled.addEventListener('change', updateRepeatControls);
+elements.repeatMode.addEventListener('change', updateRepeatControls);
+
 api.on('test-started', (state) => {
   sessions.clear();
-  for (const session of state.sessions) sessions.set(session.number, session);
+  for (const session of state.sessions) sessions.set(session.slotId, session);
   renderSessions();
   renderStatistics(state.statistics);
   setRunning(true);
@@ -245,7 +293,7 @@ api.on('test-started', (state) => {
 });
 
 api.on('session-updated', (session) => {
-  sessions.set(session.number, session);
+  sessions.set(session.slotId, session);
   renderSessions();
 });
 
@@ -270,4 +318,3 @@ api.on('fatal-error', ({ message }) => {
 api.getTestState()
   .then(loadState)
   .catch((error) => showValidation(`Не удалось получить состояние: ${error.message}`));
-
