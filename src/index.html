@@ -69,6 +69,47 @@
             </fieldset>
           </div>
 
+          <div class="repeat-panel">
+            <div class="repeat-primary">
+              <label class="switch-field">
+                <input id="repeatEnabled" name="repeatEnabled" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+                <span>
+                  <strong>Повторять завершённые сессии</strong>
+                  <small>Каждый цикл использует новый изолированный BrowserContext</small>
+                </span>
+              </label>
+              <label class="switch-field compact-switch">
+                <input id="stopSlotOnError" name="stopSlotOnError" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+                <span>
+                  <strong>Останавливать слот после ошибки</strong>
+                  <small>Другие рабочие слоты продолжат выполнение</small>
+                </span>
+              </label>
+            </div>
+            <div class="repeat-options" id="repeatOptions" hidden>
+              <label class="field">
+                <span>Режим повторов</span>
+                <select id="repeatMode" name="repeatMode">
+                  <option value="unlimited">Без ограничений</option>
+                  <option value="limited">Заданное количество циклов</option>
+                </select>
+              </label>
+              <label class="field" id="maxCyclesField" hidden>
+                <span>Количество циклов на каждый слот</span>
+                <input id="maxCycles" name="maxCycles" type="number" min="1" max="100000" step="1" required>
+              </label>
+              <label class="field">
+                <span>Задержка перезапуска, мс</span>
+                <input id="restartDelayMs" name="restartDelayMs" type="number" min="0" max="3600000" step="100" required>
+              </label>
+            </div>
+            <div class="infinite-warning" id="infiniteWarning" hidden>
+              Тест будет выполняться до ручной остановки.
+            </div>
+          </div>
+
           <div class="validation-message" id="validationMessage" role="alert" hidden></div>
           <div class="actions">
             <button class="button button-primary" id="startButton" type="submit">
@@ -86,13 +127,17 @@
       </section>
 
       <section class="statistics-grid" aria-label="Статистика теста">
-        <article class="stat-card"><span>Запланировано</span><strong id="statPlanned">0</strong></article>
-        <article class="stat-card"><span>Запущено</span><strong id="statStarted">0</strong></article>
+        <article class="stat-card"><span>Рабочих слотов</span><strong id="statPlanned">0</strong></article>
+        <article class="stat-card"><span>Запущено циклов</span><strong id="statStarted">0</strong></article>
         <article class="stat-card stat-active"><span>Активно</span><strong id="statActive">0</strong></article>
-        <article class="stat-card stat-success"><span>Завершено</span><strong id="statCompleted">0</strong></article>
-        <article class="stat-card stat-error"><span>Ошибок</span><strong id="statErrors">0</strong></article>
-        <article class="stat-card"><span>Остановлено</span><strong id="statStopped">0</strong></article>
-        <article class="stat-card stat-wide"><span>Средняя загрузка</span><strong><span id="statAverage">0</span> <small>мс</small></strong></article>
+        <article class="stat-card stat-success"><span>Успешно</span><strong id="statCompleted">0</strong></article>
+        <article class="stat-card"><span>Всего выполнено циклов</span><strong id="statTotalCycles">0</strong></article>
+        <article class="stat-card"><span>Текущий номер цикла</span><strong id="statCurrentCycle">0</strong></article>
+        <article class="stat-card"><span>Перезапущено</span><strong id="statRestarted">0</strong></article>
+        <article class="stat-card stat-error"><span>Циклов с ошибкой</span><strong id="statErrorCycles">0</strong></article>
+        <article class="stat-card"><span>Остановлено слотов</span><strong id="statStopped">0</strong></article>
+        <article class="stat-card"><span>Циклов в минуту</span><strong id="statCyclesPerMinute">0</strong></article>
+        <article class="stat-card"><span>Средняя загрузка</span><strong><span id="statAverage">0</span> <small>мс</small></strong></article>
       </section>
 
       <section class="card table-card" aria-labelledby="sessionsTitle">
@@ -107,7 +152,10 @@
           <table>
             <thead>
               <tr>
-                <th>№</th>
+                <th>Слот</th>
+                <th>Цикл</th>
+                <th>Идентификатор запуска</th>
+                <th>Перезапусков</th>
                 <th>Статус</th>
                 <th>HTTP-код</th>
                 <th>Загрузка</th>
@@ -116,7 +164,7 @@
               </tr>
             </thead>
             <tbody id="sessionRows">
-              <tr class="empty-row"><td colspan="6">Сессии появятся после запуска теста</td></tr>
+              <tr class="empty-row"><td colspan="9">Сессии появятся после запуска теста</td></tr>
             </tbody>
           </table>
         </div>

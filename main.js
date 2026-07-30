@@ -5,10 +5,13 @@ process.env.PLAYWRIGHT_BROWSERS_PATH = '0';
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const fs = require('node:fs');
 const fsp = fs.promises;
+const http = require('node:http');
 const path = require('node:path');
 const { chromium } = require('playwright');
+const { abortableDelay, runWorkerSlot } = require('./lib/scheduler');
 
 const MAX_PARALLEL_SESSIONS = 50;
+const MAX_CYCLES_PER_SLOT = 100000;
 const DEFAULT_SETTINGS = Object.freeze({
   url: 'https://example.com',
   sessionCount: 5,
@@ -17,7 +20,12 @@ const DEFAULT_SETTINGS = Object.freeze({
   navigationTimeoutMs: 30000,
   headless: true,
   viewportWidth: 1280,
-  viewportHeight: 720
+  viewportHeight: 720,
+  repeatEnabled: false,
+  repeatMode: 'unlimited',
+  maxCycles: 10,
+  restartDelayMs: 1000,
+  stopSlotOnError: false
 });
 
 let mainWindow = null;
@@ -34,9 +42,13 @@ function emptyStatistics(planned = 0) {
     started: 0,
     active: 0,
     completed: 0,
-    errors: 0,
     stopped: 0,
-    averageLoadMs: 0
+    averageLoadMs: 0,
+    totalCycles: 0,
+    currentCycle: 0,
+    restarted: 0,
+    errorCycles: 0,
+    cyclesPerMinute: 0
   };
 }
 
@@ -81,7 +93,7 @@ async function ensureDataDirectories() {
 async function loadSettings() {
   try {
     const raw = await fsp.readFile(settingsPath, 'utf8');
-    settings = validateSettings(JSON.parse(raw));
+    settings = validateSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(raw) });
   } catch (error) {
     settings = { ...DEFAULT_SETTINGS };
     if (error.code !== 'ENOENT') {
@@ -130,6 +142,8 @@ function validateSettings(input) {
     throw new Error('URL не должен содержать имя пользователя или пароль.');
   }
 
+  const repeatMode = input.repeatMode === 'limited' ? 'limited' : 'unlimited';
+
   return {
     url: url.href,
     sessionCount: validateInteger(input.sessionCount, 'Количество сессий', 1, MAX_PARALLEL_SESSIONS),
@@ -138,36 +152,41 @@ function validateSettings(input) {
     navigationTimeoutMs: validateInteger(input.navigationTimeoutMs, 'Тайм-аут загрузки', 1000, 300000),
     headless: input.headless !== false,
     viewportWidth: validateInteger(input.viewportWidth, 'Ширина окна', 320, 7680),
-    viewportHeight: validateInteger(input.viewportHeight, 'Высота окна', 240, 4320)
+    viewportHeight: validateInteger(input.viewportHeight, 'Высота окна', 240, 4320),
+    repeatEnabled: input.repeatEnabled === true,
+    repeatMode,
+    maxCycles: validateInteger(input.maxCycles, 'Количество циклов', 1, MAX_CYCLES_PER_SLOT),
+    restartDelayMs: validateInteger(input.restartDelayMs, 'Задержка перезапуска', 0, 3600000),
+    stopSlotOnError: input.stopSlotOnError === true
   };
 }
 
 function calculateStatistics(run) {
-  const sessions = run.sessions;
-  const loaded = sessions.filter((session) => Number.isFinite(session.loadTimeMs));
-  const averageLoadMs = loaded.length
-    ? Math.round(loaded.reduce((sum, session) => sum + session.loadTimeMs, 0) / loaded.length)
-    : 0;
-
+  const elapsedMinutes = Math.max((performance.now() - run.startedAtPerformance) / 60000, 1 / 60000);
   return {
-    planned: sessions.length,
-    started: sessions.filter((session) => session.startedAt).length,
-    active: sessions.filter((session) => ['Запуск', 'Загрузка', 'Активно'].includes(session.status)).length,
-    completed: sessions.filter((session) => session.status === 'Завершено').length,
-    errors: sessions.filter((session) => session.status === 'Ошибка').length,
-    stopped: sessions.filter((session) => session.status === 'Остановлено').length,
-    averageLoadMs
+    planned: run.sessions.length,
+    started: run.metrics.cyclesStarted,
+    active: run.sessions.filter((session) => ['Запуск', 'Загрузка', 'Активно'].includes(session.status)).length,
+    completed: run.metrics.cyclesSucceeded,
+    stopped: run.sessions.filter((session) => session.status === 'Остановлено').length,
+    averageLoadMs: run.metrics.loadCount ? Math.round(run.metrics.loadTotalMs / run.metrics.loadCount) : 0,
+    totalCycles: run.metrics.cyclesCompleted,
+    currentCycle: run.metrics.currentCycle,
+    restarted: run.metrics.restarted,
+    errorCycles: run.metrics.cyclesErrored,
+    cyclesPerMinute: Number((run.metrics.cyclesCompleted / elapsedMinutes).toFixed(1))
   };
 }
 
 function publishStatistics(run) {
+  if (currentRun !== run) return;
   publicState.statistics = calculateStatistics(run);
   send('statistics-updated', clone(publicState.statistics));
 }
 
 function publishSession(run, session) {
   if (currentRun !== run) return;
-  publicState.sessions[session.number - 1] = clone(session);
+  publicState.sessions[session.slotId - 1] = clone(session);
   send('session-updated', clone(session));
   publishStatistics(run);
 }
@@ -175,6 +194,19 @@ function publishSession(run, session) {
 function updateSession(run, session, patch) {
   Object.assign(session, patch);
   publishSession(run, session);
+}
+
+function markUnfinishedSessionsStopped(run) {
+  for (const session of run.sessions) {
+    if (['Ожидание', 'Запуск', 'Загрузка', 'Активно'].includes(session.status)) {
+      updateSession(run, session, {
+        status: 'Остановлено',
+        errorText: session.cycle > 0
+          ? 'Остановлено пользователем'
+          : 'Не запущено: тест остановлен'
+      });
+    }
+  }
 }
 
 function createLogger(run) {
@@ -194,26 +226,6 @@ function createLogger(run) {
   };
 }
 
-function cancellableDelay(run, milliseconds) {
-  if (run.cancelled || milliseconds <= 0) return Promise.resolve();
-  return new Promise((resolve) => {
-    const token = { timer: null, resolve };
-    token.timer = setTimeout(() => {
-      run.delays.delete(token);
-      resolve();
-    }, milliseconds);
-    run.delays.add(token);
-  });
-}
-
-function cancelDelays(run) {
-  for (const token of run.delays) {
-    clearTimeout(token.timer);
-    token.resolve();
-  }
-  run.delays.clear();
-}
-
 function resolveBrowserExecutable() {
   const expected = chromium.executablePath();
   if (!app.isPackaged || !expected.includes('app.asar')) return expected;
@@ -221,21 +233,41 @@ function resolveBrowserExecutable() {
   return fs.existsSync(unpacked) ? unpacked : expected;
 }
 
-async function runOneSession(run, session) {
+function recordCompletedCycle(run, outcome, loadTimeMs = null) {
+  run.metrics.cyclesCompleted += 1;
+  if (outcome === 'success') run.metrics.cyclesSucceeded += 1;
+  if (outcome === 'error') run.metrics.cyclesErrored += 1;
+  if (Number.isFinite(loadTimeMs)) {
+    run.metrics.loadTotalMs += loadTimeMs;
+    run.metrics.loadCount += 1;
+  }
+}
+
+async function runIsolatedSession(run, session, cycle, abortSignal) {
   let context = null;
   let page = null;
+  const runId = `slot-${session.slotId}-cycle-${cycle}`;
+
+  if (abortSignal.aborted) return { stopped: true, error: false };
+
+  run.metrics.cyclesStarted += 1;
+  run.metrics.currentCycle = Math.max(run.metrics.currentCycle, cycle);
+  if (cycle > 1) run.metrics.restarted += 1;
+
+  updateSession(run, session, {
+    cycle,
+    restartCount: cycle - 1,
+    runId,
+    status: 'Запуск',
+    httpStatus: null,
+    loadTimeMs: null,
+    startedAt: formatDate(),
+    errorText: ''
+  });
+  run.log('INFO', `${runId}: запуск нового изолированного контекста.`);
 
   try {
-    if (run.cancelled) {
-      updateSession(run, session, { status: 'Остановлено', errorText: 'Остановлено пользователем' });
-      return;
-    }
-
-    updateSession(run, session, {
-      status: 'Запуск',
-      startedAt: formatDate()
-    });
-    run.log('INFO', `Сессия ${session.number}: запуск.`);
+    if (abortSignal.aborted) return { stopped: true, error: false };
 
     context = await run.browser.newContext({
       viewport: {
@@ -245,7 +277,7 @@ async function runOneSession(run, session) {
     });
     run.contexts.add(context);
 
-    if (run.cancelled) throw new Error('Тест остановлен пользователем');
+    if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
     page = await context.newPage();
     run.pages.add(page);
@@ -259,19 +291,20 @@ async function runOneSession(run, session) {
     const loadTimeMs = Math.round(performance.now() - started);
     const httpStatus = response ? response.status() : null;
 
-    if (run.cancelled) throw new Error('Тест остановлен пользователем');
+    if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
     if (httpStatus !== null && httpStatus >= 400) {
       const statusText = response.statusText() || 'Ошибка HTTP';
       const errorText = `HTTP ${httpStatus} ${statusText}`.trim();
+      recordCompletedCycle(run, 'error', loadTimeMs);
       updateSession(run, session, {
         status: 'Ошибка',
         httpStatus,
         loadTimeMs,
         errorText
       });
-      run.log('WARN', `Сессия ${session.number}: сервер вернул ${errorText}, загрузка ${loadTimeMs} мс.`);
-      return;
+      run.log('WARN', `${runId}: сервер вернул ${errorText}, загрузка ${loadTimeMs} мс.`);
+      return { stopped: false, error: true };
     }
 
     updateSession(run, session, {
@@ -280,28 +313,33 @@ async function runOneSession(run, session) {
       loadTimeMs,
       errorText: ''
     });
-    run.log('INFO', `Сессия ${session.number}: страница загружена за ${loadTimeMs} мс, HTTP ${httpStatus ?? 'нет ответа'}.`);
+    run.log('INFO', `${runId}: страница загружена за ${loadTimeMs} мс, HTTP ${httpStatus ?? 'нет ответа'}.`);
 
-    await cancellableDelay(run, run.settings.durationSeconds * 1000);
-    if (run.cancelled) throw new Error('Тест остановлен пользователем');
+    await abortableDelay(run.settings.durationSeconds * 1000, abortSignal);
+    if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
+    recordCompletedCycle(run, 'success', loadTimeMs);
     updateSession(run, session, { status: 'Завершено' });
-    run.log('INFO', `Сессия ${session.number}: завершена.`);
+    run.log('INFO', `${runId}: цикл завершён.`);
+    return { stopped: false, error: false };
   } catch (error) {
-    if (run.cancelled) {
+    if (abortSignal.aborted || error.name === 'AbortError') {
       updateSession(run, session, {
         status: 'Остановлено',
         errorText: 'Остановлено пользователем'
       });
-      run.log('WARN', `Сессия ${session.number}: остановлена пользователем.`);
-    } else {
-      const message = serializableError(error);
-      updateSession(run, session, {
-        status: 'Ошибка',
-        errorText: message
-      });
-      run.log('ERROR', `Сессия ${session.number}: ${message}`);
+      run.log('WARN', `${runId}: цикл остановлен пользователем.`);
+      return { stopped: true, error: false };
     }
+
+    const message = serializableError(error);
+    recordCompletedCycle(run, 'error');
+    updateSession(run, session, {
+      status: 'Ошибка',
+      errorText: message
+    });
+    run.log('ERROR', `${runId}: ${message}`);
+    return { stopped: false, error: true };
   } finally {
     if (page) {
       run.pages.delete(page);
@@ -315,7 +353,6 @@ async function runOneSession(run, session) {
 }
 
 async function closeRunResources(run) {
-  cancelDelays(run);
   const pages = [...run.pages];
   const contexts = [...run.contexts];
   run.pages.clear();
@@ -331,55 +368,59 @@ async function closeRunResources(run) {
 
 async function executeRun(run) {
   try {
-    run.log('INFO', `Тест начат: ${run.settings.sessionCount} сессий, адрес ${run.settings.url}.`);
+    const repeatDescription = run.settings.repeatEnabled
+      ? run.settings.repeatMode === 'limited'
+        ? `до ${run.settings.maxCycles} циклов на слот`
+        : 'без ограничения циклов'
+      : 'по одному циклу на слот';
+    run.log('INFO', `Тест начат: ${run.settings.sessionCount} рабочих слотов, ${repeatDescription}, адрес ${run.settings.url}.`);
+
     run.browser = await chromium.launch({
       headless: run.settings.headless,
       executablePath: resolveBrowserExecutable()
     });
 
-    for (let index = 0; index < run.sessions.length; index += 1) {
-      if (run.cancelled) break;
-      if (index > 0) await cancellableDelay(run, run.settings.launchDelayMs);
-      if (run.cancelled) break;
-      const task = runOneSession(run, run.sessions[index]);
-      run.tasks.add(task);
-      task.finally(() => run.tasks.delete(task));
+    if (run.abortController.signal.aborted) {
+      markUnfinishedSessionsStopped(run);
+      await closeRunResources(run);
+      run.log('WARN', 'Тест остановлен до запуска рабочих слотов.');
+      send('test-stopped', clone(calculateStatistics(run)));
+      return;
     }
 
-    if (run.cancelled) {
-      for (const session of run.sessions) {
-        if (session.status === 'Ожидание') {
-          updateSession(run, session, {
-            status: 'Остановлено',
-            errorText: 'Не запущено: тест остановлен'
-          });
-        }
-      }
-    }
+    run.workers = run.sessions.map((session, index) => runWorkerSlot({
+      slotId: session.slotId,
+      options: run.settings,
+      abortSignal: run.abortController.signal,
+      initialDelayMs: index * run.settings.launchDelayMs,
+      runCycle: ({ cycle, abortSignal }) => runIsolatedSession(run, session, cycle, abortSignal)
+    }));
 
-    await Promise.allSettled([...run.tasks]);
+    await Promise.allSettled(run.workers);
+    if (run.abortController.signal.aborted) markUnfinishedSessionsStopped(run);
     await closeRunResources(run);
 
-    if (run.cancelled) {
+    if (run.abortController.signal.aborted) {
       run.log('WARN', 'Тест остановлен пользователем.');
       send('test-stopped', clone(calculateStatistics(run)));
     } else {
-      run.log('INFO', 'Все сессии завершены.');
+      run.log('INFO', 'Все рабочие слоты завершены.');
       send('test-finished', clone(calculateStatistics(run)));
     }
   } catch (error) {
     const message = serializableError(error);
-    run.log('ERROR', `Критическая ошибка: ${message}`);
+    run.abortController.abort();
+    run.log('ERROR', `Критическая ошибка запуска Chromium: ${message}`);
     for (const session of run.sessions) {
       if (!['Завершено', 'Ошибка', 'Остановлено'].includes(session.status)) {
         updateSession(run, session, {
-          status: run.cancelled ? 'Остановлено' : 'Ошибка',
-          errorText: run.cancelled ? 'Остановлено пользователем' : message
+          status: 'Ошибка',
+          errorText: message
         });
       }
     }
     await closeRunResources(run);
-    if (!run.cancelled) send('fatal-error', { message });
+    send('fatal-error', { message });
   } finally {
     if (currentRun === run) {
       publicState.running = false;
@@ -404,7 +445,10 @@ async function startTest(_event, rawSettings) {
   }
 
   const sessions = Array.from({ length: validated.sessionCount }, (_, index) => ({
-    number: index + 1,
+    slotId: index + 1,
+    cycle: 0,
+    restartCount: 0,
+    runId: '',
     status: 'Ожидание',
     httpStatus: null,
     loadTimeMs: null,
@@ -417,13 +461,23 @@ async function startTest(_event, rawSettings) {
     browser: null,
     contexts: new Set(),
     pages: new Set(),
-    tasks: new Set(),
-    delays: new Set(),
-    cancelled: false,
+    workers: [],
+    abortController: new AbortController(),
     stopping: null,
     completion: null,
     log: null,
-    logPath: ''
+    logPath: '',
+    startedAtPerformance: performance.now(),
+    metrics: {
+      cyclesStarted: 0,
+      cyclesCompleted: 0,
+      cyclesSucceeded: 0,
+      cyclesErrored: 0,
+      restarted: 0,
+      currentCycle: 0,
+      loadTotalMs: 0,
+      loadCount: 0
+    }
   };
   run.log = createLogger(run);
   currentRun = run;
@@ -444,10 +498,10 @@ async function stopCurrentTest() {
   if (!run) return { ok: true, alreadyStopped: true };
   if (run.stopping) return run.stopping;
 
-  run.cancelled = true;
+  run.abortController.abort();
   run.stopping = (async () => {
-    run.log('WARN', 'Получена команда остановки.');
-    cancelDelays(run);
+    run.log('WARN', 'Получена команда остановки: новые циклы запрещены.');
+    markUnfinishedSessionsStopped(run);
     await closeRunResources(run);
     if (run.completion) await run.completion;
     return { ok: true };
@@ -467,12 +521,14 @@ function registerIpc() {
 }
 
 function createWindow() {
+  const smokeMode = process.argv.includes('--smoke-test')
+    || process.argv.includes('--cycle-smoke-test');
   mainWindow = new BrowserWindow({
-    width: 1360,
-    height: 900,
-    minWidth: 980,
-    minHeight: 720,
-    show: !process.argv.includes('--smoke-test'),
+    width: 1480,
+    height: 940,
+    minWidth: 1080,
+    minHeight: 760,
+    show: !smokeMode,
     backgroundColor: '#0a0e17',
     icon: path.join(__dirname, 'assets', 'icon.ico'),
     webPreferences: {
@@ -518,6 +574,51 @@ function createWindow() {
   }
 }
 
+async function runCycleSmokeTest() {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end('<!doctype html><title>Cycle smoke</title><p>OK</p>');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const address = server.address();
+    const result = await startTest(null, {
+      ...DEFAULT_SETTINGS,
+      url: `http://127.0.0.1:${address.port}/`,
+      sessionCount: 2,
+      durationSeconds: 0,
+      launchDelayMs: 0,
+      repeatEnabled: true,
+      repeatMode: 'limited',
+      maxCycles: 3,
+      restartDelayMs: 0
+    });
+    if (!result.ok) throw new Error(result.error);
+
+    const run = currentRun;
+    await run.completion;
+    const statistics = publicState.statistics;
+    if (statistics.totalCycles !== 6
+        || statistics.completed !== 6
+        || statistics.restarted !== 4
+        || statistics.errorCycles !== 0
+        || statistics.currentCycle !== 3) {
+      throw new Error(`Неожиданная статистика: ${JSON.stringify(statistics)}`);
+    }
+    console.log('CYCLE_SMOKE_TEST_OK');
+  } catch (error) {
+    process.exitCode = 1;
+    throw error;
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    app.quit();
+  }
+}
+
 process.on('unhandledRejection', (error) => {
   const message = serializableError(error);
   console.error('Необработанная ошибка Promise:', message);
@@ -537,6 +638,9 @@ app.whenReady().then(async () => {
   await loadSettings();
   registerIpc();
   createWindow();
+  if (process.argv.includes('--cycle-smoke-test')) {
+    await runCycleSmokeTest();
+  }
 });
 
 app.on('window-all-closed', async () => {
@@ -545,8 +649,5 @@ app.on('window-all-closed', async () => {
 });
 
 app.on('before-quit', () => {
-  if (currentRun) {
-    currentRun.cancelled = true;
-    cancelDelays(currentRun);
-  }
+  if (currentRun) currentRun.abortController.abort();
 });
