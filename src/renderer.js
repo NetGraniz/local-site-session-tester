@@ -15,14 +15,22 @@ const logOutput = document.querySelector('#logOutput');
 const repeatOptions = document.querySelector('#repeatOptions');
 const maxCyclesField = document.querySelector('#maxCyclesField');
 const infiniteWarning = document.querySelector('#infiniteWarning');
-const fields = [...form.querySelectorAll('input, select')];
+const durationFixedField = document.querySelector('#durationFixedField');
+const durationMinField = document.querySelector('#durationMinField');
+const durationMaxField = document.querySelector('#durationMaxField');
+const randomActionsOptions = document.querySelector('#randomActionsOptions');
+const copyAddressOptions = document.querySelector('#copyAddressOptions');
+const fields = [...form.querySelectorAll('input, select, textarea')];
 
 let isRunning = false;
 
 const elements = {
   url: document.querySelector('#url'),
   sessionCount: document.querySelector('#sessionCount'),
+  durationMode: document.querySelector('#durationMode'),
   durationSeconds: document.querySelector('#durationSeconds'),
+  minDurationSeconds: document.querySelector('#minDurationSeconds'),
+  maxDurationSeconds: document.querySelector('#maxDurationSeconds'),
   launchDelayMs: document.querySelector('#launchDelayMs'),
   navigationTimeoutMs: document.querySelector('#navigationTimeoutMs'),
   headless: document.querySelector('#headless'),
@@ -32,7 +40,26 @@ const elements = {
   repeatMode: document.querySelector('#repeatMode'),
   maxCycles: document.querySelector('#maxCycles'),
   restartDelayMs: document.querySelector('#restartDelayMs'),
-  stopSlotOnError: document.querySelector('#stopSlotOnError')
+  stopSlotOnError: document.querySelector('#stopSlotOnError'),
+  randomActionsEnabled: document.querySelector('#randomActionsEnabled'),
+  randomActionsMin: document.querySelector('#randomActionsMin'),
+  randomActionsMax: document.querySelector('#randomActionsMax'),
+  actionDelayMinMs: document.querySelector('#actionDelayMinMs'),
+  actionDelayMaxMs: document.querySelector('#actionDelayMaxMs'),
+  actionTimeoutMs: document.querySelector('#actionTimeoutMs'),
+  maxNavigationDepth: document.querySelector('#maxNavigationDepth'),
+  allowInternalNavigation: document.querySelector('#allowInternalNavigation'),
+  allowButtonClicks: document.querySelector('#allowButtonClicks'),
+  allowScrolling: document.querySelector('#allowScrolling'),
+  allowGoBack: document.querySelector('#allowGoBack'),
+  allowedSelectors: document.querySelector('#allowedSelectors'),
+  blockedSelectors: document.querySelector('#blockedSelectors'),
+  autoDiscoverSafeElements: document.querySelector('#autoDiscoverSafeElements'),
+  blockedActionWords: document.querySelector('#blockedActionWords'),
+  randomActionsSeed: document.querySelector('#randomActionsSeed'),
+  copyServerAddressEnabled: document.querySelector('#copyServerAddressEnabled'),
+  copyServerAddressSelector: document.querySelector('#copyServerAddressSelector'),
+  copyActionOrder: document.querySelector('#copyActionOrder')
 };
 
 const statElements = {
@@ -46,10 +73,30 @@ const statElements = {
   currentCycle: document.querySelector('#statCurrentCycle'),
   restarted: document.querySelector('#statRestarted'),
   errorCycles: document.querySelector('#statErrorCycles'),
-  cyclesPerMinute: document.querySelector('#statCyclesPerMinute')
+  cyclesPerMinute: document.querySelector('#statCyclesPerMinute'),
+  randomActionsTotal: document.querySelector('#statRandomActionsTotal'),
+  internalNavigations: document.querySelector('#statInternalNavigations'),
+  buttonClicks: document.querySelector('#statButtonClicks'),
+  scrolls: document.querySelector('#statScrolls'),
+  goBacks: document.querySelector('#statGoBacks'),
+  dangerousSkipped: document.querySelector('#statDangerousSkipped'),
+  actionErrors: document.querySelector('#statActionErrors')
 };
 
 const sessions = new Map();
+
+function updateDurationControls() {
+  const rangeMode = elements.durationMode.value === 'range';
+  durationFixedField.hidden = rangeMode;
+  durationMinField.hidden = !rangeMode;
+  durationMaxField.hidden = !rangeMode;
+
+  if (!isRunning) {
+    elements.durationSeconds.disabled = rangeMode;
+    elements.minDurationSeconds.disabled = !rangeMode;
+    elements.maxDurationSeconds.disabled = !rangeMode;
+  }
+}
 
 function updateRepeatControls() {
   const repeatEnabled = elements.repeatEnabled.checked;
@@ -66,6 +113,37 @@ function updateRepeatControls() {
   }
 }
 
+function updateRandomActionsControls() {
+  const actionsEnabled = elements.randomActionsEnabled.checked;
+  const copyEnabled = elements.copyServerAddressEnabled.checked;
+  randomActionsOptions.hidden = !actionsEnabled;
+  copyAddressOptions.hidden = !copyEnabled;
+
+  if (!isRunning) {
+    for (const key of [
+      'randomActionsMin',
+      'randomActionsMax',
+      'actionDelayMinMs',
+      'actionDelayMaxMs',
+      'actionTimeoutMs',
+      'maxNavigationDepth',
+      'allowInternalNavigation',
+      'allowButtonClicks',
+      'allowScrolling',
+      'allowGoBack',
+      'allowedSelectors',
+      'blockedSelectors',
+      'autoDiscoverSafeElements',
+      'blockedActionWords',
+      'randomActionsSeed'
+    ]) {
+      elements[key].disabled = !actionsEnabled;
+    }
+    elements.copyServerAddressSelector.disabled = !copyEnabled;
+    elements.copyActionOrder.disabled = !copyEnabled;
+  }
+}
+
 function setRunning(running, label) {
   isRunning = running;
   fields.forEach((field) => {
@@ -75,7 +153,11 @@ function setRunning(running, label) {
   stopButton.disabled = !running;
   runState.classList.toggle('is-active', running);
   runStateText.textContent = label || (running ? 'Тест выполняется' : 'Готово к запуску');
-  if (!running) updateRepeatControls();
+  if (!running) {
+    updateDurationControls();
+    updateRepeatControls();
+    updateRandomActionsControls();
+  }
 }
 
 function showValidation(message) {
@@ -93,14 +175,19 @@ function populateSettings(settings) {
       element.value = settings[key] ?? '';
     }
   }
+  updateDurationControls();
   updateRepeatControls();
+  updateRandomActionsControls();
 }
 
 function collectSettings() {
   return {
     url: elements.url.value.trim(),
     sessionCount: Number(elements.sessionCount.value),
+    durationMode: elements.durationMode.value,
     durationSeconds: Number(elements.durationSeconds.value),
+    minDurationSeconds: Number(elements.minDurationSeconds.value),
+    maxDurationSeconds: Number(elements.maxDurationSeconds.value),
     launchDelayMs: Number(elements.launchDelayMs.value),
     navigationTimeoutMs: Number(elements.navigationTimeoutMs.value),
     headless: elements.headless.value === 'true',
@@ -110,7 +197,28 @@ function collectSettings() {
     repeatMode: elements.repeatMode.value,
     maxCycles: Number(elements.maxCycles.value),
     restartDelayMs: Number(elements.restartDelayMs.value),
-    stopSlotOnError: elements.stopSlotOnError.checked
+    stopSlotOnError: elements.stopSlotOnError.checked,
+    randomActionsEnabled: elements.randomActionsEnabled.checked,
+    randomActionsMin: Number(elements.randomActionsMin.value),
+    randomActionsMax: Number(elements.randomActionsMax.value),
+    actionDelayMinMs: Number(elements.actionDelayMinMs.value),
+    actionDelayMaxMs: Number(elements.actionDelayMaxMs.value),
+    actionTimeoutMs: Number(elements.actionTimeoutMs.value),
+    maxNavigationDepth: Number(elements.maxNavigationDepth.value),
+    allowInternalNavigation: elements.allowInternalNavigation.checked,
+    allowButtonClicks: elements.allowButtonClicks.checked,
+    allowScrolling: elements.allowScrolling.checked,
+    allowGoBack: elements.allowGoBack.checked,
+    allowedSelectors: elements.allowedSelectors.value.trim(),
+    blockedSelectors: elements.blockedSelectors.value.trim(),
+    autoDiscoverSafeElements: elements.autoDiscoverSafeElements.checked,
+    blockedActionWords: elements.blockedActionWords.value.trim(),
+    randomActionsSeed: elements.randomActionsSeed.value.trim() === ''
+      ? null
+      : Number(elements.randomActionsSeed.value),
+    copyServerAddressEnabled: elements.copyServerAddressEnabled.checked,
+    copyServerAddressSelector: elements.copyServerAddressSelector.value.trim(),
+    copyActionOrder: elements.copyActionOrder.value
   };
 }
 
@@ -128,9 +236,27 @@ function validateLocally(settings) {
     form.reportValidity();
     return 'Проверьте числовые параметры теста.';
   }
+  if (settings.durationMode === 'range' && settings.maxDurationSeconds < settings.minDurationSeconds) {
+    return 'Максимальная длительность не может быть меньше минимальной.';
+  }
   if (settings.repeatEnabled && settings.repeatMode === 'limited'
       && (!Number.isInteger(settings.maxCycles) || settings.maxCycles < 1 || settings.maxCycles > 100000)) {
     return 'Количество циклов на слот должно быть от 1 до 100000.';
+  }
+  if (settings.randomActionsMax < settings.randomActionsMin) {
+    return 'Максимальное количество действий не может быть меньше минимального.';
+  }
+  if (settings.actionDelayMaxMs < settings.actionDelayMinMs) {
+    return 'Максимальная задержка действий не может быть меньше минимальной.';
+  }
+  if (settings.randomActionsSeed !== null
+      && (!Number.isInteger(settings.randomActionsSeed)
+        || settings.randomActionsSeed < 0
+        || settings.randomActionsSeed > 4294967295)) {
+    return 'Seed должен быть целым числом от 0 до 4294967295 или оставаться пустым.';
+  }
+  if (settings.copyServerAddressEnabled && !settings.copyServerAddressSelector) {
+    return 'Укажите селектор кнопки копирования адреса.';
   }
   return '';
 }
@@ -164,7 +290,7 @@ function renderSessions() {
     const row = document.createElement('tr');
     row.className = 'empty-row';
     const cell = createCell('Сессии появятся после запуска теста');
-    cell.colSpan = 9;
+    cell.colSpan = 14;
     row.append(cell);
     sessionRows.append(row);
     return;
@@ -183,6 +309,11 @@ function renderSessions() {
       createCell(session.cycle || '—', 'mono'),
       createCell(session.runId || '—', 'mono run-id'),
       createCell(String(session.restartCount || 0), 'mono'),
+      createCell(session.durationSeconds ? `${session.durationSeconds} сек` : '—', 'mono'),
+      createCell(session.lastAction || '—', 'last-action'),
+      createCell(String(session.actionCount || 0), 'mono'),
+      createCell(session.currentUrl || '—', 'mono current-url'),
+      createCell(session.seed ?? '—', 'mono'),
       statusCell,
       createCell(session.httpStatus ?? '—', 'mono'),
       createCell(session.loadTimeMs === null ? '—' : `${session.loadTimeMs} мс`, 'mono'),
@@ -282,6 +413,9 @@ openLogsButton.addEventListener('click', async () => {
 
 elements.repeatEnabled.addEventListener('change', updateRepeatControls);
 elements.repeatMode.addEventListener('change', updateRepeatControls);
+elements.durationMode.addEventListener('change', updateDurationControls);
+elements.randomActionsEnabled.addEventListener('change', updateRandomActionsControls);
+elements.copyServerAddressEnabled.addEventListener('change', updateRandomActionsControls);
 
 api.on('test-started', (state) => {
   sessions.clear();

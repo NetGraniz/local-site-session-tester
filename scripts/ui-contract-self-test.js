@@ -23,9 +23,54 @@ for (const requiredText of [
   'Циклов с ошибкой',
   'Циклов в минуту',
   'Тест будет выполняться до ручной остановки.',
-  'Идентификатор запуска'
+  'Идентификатор запуска',
+  'Режим длительности',
+  'Случайно в диапазоне',
+  'Минимальная длительность, сек',
+  'Максимальная длительность, сек',
+  'Длительность цикла',
+  'Выполнять случайные действия',
+  'Минимум действий за цикл',
+  'Максимум действий за цикл',
+  'Разрешённые селекторы',
+  'Запрещённые селекторы',
+  'Автоматически находить безопасные элементы',
+  'Seed случайных действий',
+  'Копировать адрес до случайных действий',
+  'Копировать адрес после случайных действий',
+  'Всего случайных действий',
+  'Пропущено опасных элементов',
+  'Последнее действие',
+  'Текущий URL'
 ]) {
   assert.equal(html.includes(requiredText), true, `В интерфейсе отсутствует текст: ${requiredText}`);
 }
+
+for (const requiredId of [
+  'randomActionsEnabled',
+  'randomActionsMin',
+  'randomActionsMax',
+  'actionDelayMinMs',
+  'actionDelayMaxMs',
+  'actionTimeoutMs',
+  'maxNavigationDepth',
+  'allowInternalNavigation',
+  'allowButtonClicks',
+  'allowScrolling',
+  'allowGoBack',
+  'allowedSelectors',
+  'blockedSelectors',
+  'autoDiscoverSafeElements',
+  'blockedActionWords',
+  'randomActionsSeed',
+  'copyServerAddressEnabled',
+  'copyServerAddressSelector',
+  'copyActionOrder'
+]) {
+  assert.equal(uniqueIds.has(requiredId), true, `В интерфейсе отсутствует id: ${requiredId}`);
+}
+
+assert.match(html, /<td colspan="14">/);
+assert.match(renderer, /querySelectorAll\('input, select, textarea'\)/);
 
 console.log('UI_CONTRACT_SELF_TEST_OK');

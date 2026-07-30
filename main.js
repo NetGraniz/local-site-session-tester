@@ -9,13 +9,70 @@ const http = require('node:http');
 const path = require('node:path');
 const { chromium } = require('playwright');
 const { abortableDelay, runWorkerSlot } = require('./lib/scheduler');
+const { selectCycleDurationSeconds, settleWithin } = require('./lib/runtime-utils');
+const {
+  generateSeed,
+  performCopyServerAddressAction,
+  performRandomActions,
+  safeUrl,
+  truncateText
+} = require('./lib/random-actions');
 
 const MAX_PARALLEL_SESSIONS = 50;
 const MAX_CYCLES_PER_SLOT = 100000;
+const MIN_DURATION_SECONDS = 10;
+const MAX_DURATION_SECONDS = 86400;
+const RESOURCE_CLOSE_TIMEOUT_MS = 2000;
+const BROWSER_KILL_TIMEOUT_MS = 5000;
+const STOP_COMPLETION_TIMEOUT_MS = 10000;
+const DEFAULT_ALLOWED_SELECTORS = [
+  'nav a',
+  '.menu a',
+  '.category-card a',
+  'button[data-test="show-details"]',
+  'server-card button.copy'
+].join('\n');
+const DEFAULT_BLOCKED_SELECTORS = [
+  'button[type="submit"]',
+  'input[type="submit"]',
+  'a[target="_blank"]',
+  '[data-danger]',
+  '.danger',
+  '.delete',
+  '.logout',
+  '.signout',
+  '.payment',
+  '.checkout',
+  '.admin'
+].join('\n');
+const DEFAULT_BLOCKED_ACTION_WORDS = [
+  'удалить',
+  'оплатить',
+  'купить',
+  'заказать',
+  'выйти',
+  'выход',
+  'отправить',
+  'подтвердить',
+  'бан',
+  'блокировать',
+  'delete',
+  'remove',
+  'purchase',
+  'checkout',
+  'pay',
+  'logout',
+  'sign out',
+  'submit',
+  'confirm'
+].join('\n');
 const DEFAULT_SETTINGS = Object.freeze({
   url: 'https://example.com',
   sessionCount: 5,
+  durationMode: 'fixed',
   durationSeconds: 15,
+  minDurationSeconds: 15,
+  maxDurationSeconds: 60,
   launchDelayMs: 300,
   navigationTimeoutMs: 30000,
   headless: true,
@@ -25,7 +82,26 @@ const DEFAULT_SETTINGS = Object.freeze({
   repeatMode: 'unlimited',
   maxCycles: 10,
   restartDelayMs: 1000,
-  stopSlotOnError: false
+  stopSlotOnError: false,
+  randomActionsEnabled: false,
+  randomActionsMin: 1,
+  randomActionsMax: 5,
+  actionDelayMinMs: 800,
+  actionDelayMaxMs: 2500,
+  actionTimeoutMs: 5000,
+  maxNavigationDepth: 3,
+  allowInternalNavigation: true,
+  allowButtonClicks: true,
+  allowScrolling: true,
+  allowGoBack: true,
+  allowedSelectors: DEFAULT_ALLOWED_SELECTORS,
+  blockedSelectors: DEFAULT_BLOCKED_SELECTORS,
+  autoDiscoverSafeElements: false,
+  blockedActionWords: DEFAULT_BLOCKED_ACTION_WORDS,
+  randomActionsSeed: null,
+  copyServerAddressEnabled: false,
+  copyServerAddressSelector: 'server-card button.copy',
+  copyActionOrder: 'before'
 });
 
 let mainWindow = null;
@@ -48,7 +124,14 @@ function emptyStatistics(planned = 0) {
     currentCycle: 0,
     restarted: 0,
     errorCycles: 0,
-    cyclesPerMinute: 0
+    cyclesPerMinute: 0,
+    randomActionsTotal: 0,
+    internalNavigations: 0,
+    buttonClicks: 0,
+    scrolls: 0,
+    goBacks: 0,
+    dangerousSkipped: 0,
+    actionErrors: 0
   };
 }
 
@@ -79,8 +162,22 @@ function send(channel, payload) {
   }
 }
 
+function sendTerminal(run, channel, payload) {
+  if (run.terminalEventSent) return;
+  run.terminalEventSent = true;
+  send(channel, payload);
+}
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function finishPublicRun(run) {
+  if (currentRun !== run) return;
+  publicState.running = false;
+  publicState.sessions = clone(run.sessions);
+  publicState.statistics = calculateStatistics(run);
+  currentRun = null;
 }
 
 async function ensureDataDirectories() {
@@ -124,6 +221,25 @@ function validateInteger(value, label, min, max) {
   return number;
 }
 
+function validateMultiline(value, label, maxLines = 100, maxLineLength = 500) {
+  const lines = String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length > maxLines) {
+    throw new Error(`${label}: разрешено не более ${maxLines} строк.`);
+  }
+  if (lines.some((line) => line.length > maxLineLength)) {
+    throw new Error(`${label}: длина одной строки не должна превышать ${maxLineLength} символов.`);
+  }
+  return [...new Set(lines)].join('\n');
+}
+
+function validateOptionalSeed(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  return validateInteger(value, 'Seed случайных действий', 0, 0xffffffff);
+}
+
 function validateSettings(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('Параметры теста имеют неверный формат.');
@@ -143,11 +259,85 @@ function validateSettings(input) {
   }
 
   const repeatMode = input.repeatMode === 'limited' ? 'limited' : 'unlimited';
+  const durationMode = input.durationMode === 'range' ? 'range' : 'fixed';
+  const durationSeconds = validateInteger(
+    input.durationSeconds,
+    'Фиксированная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  const minDurationSeconds = validateInteger(
+    input.minDurationSeconds,
+    'Минимальная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  const maxDurationSeconds = validateInteger(
+    input.maxDurationSeconds,
+    'Максимальная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  if (durationMode === 'range' && maxDurationSeconds < minDurationSeconds) {
+    throw new Error('Максимальная длительность не может быть меньше минимальной.');
+  }
+  const randomActionsMin = validateInteger(
+    input.randomActionsMin,
+    'Минимальное количество случайных действий',
+    1,
+    100
+  );
+  const randomActionsMax = validateInteger(
+    input.randomActionsMax,
+    'Максимальное количество случайных действий',
+    1,
+    100
+  );
+  if (randomActionsMax < randomActionsMin) {
+    throw new Error('Максимальное количество действий не может быть меньше минимального.');
+  }
+  const actionDelayMinMs = validateInteger(
+    input.actionDelayMinMs,
+    'Минимальная задержка между действиями',
+    100,
+    60000
+  );
+  const actionDelayMaxMs = validateInteger(
+    input.actionDelayMaxMs,
+    'Максимальная задержка между действиями',
+    100,
+    60000
+  );
+  if (actionDelayMaxMs < actionDelayMinMs) {
+    throw new Error('Максимальная задержка действий не может быть меньше минимальной.');
+  }
+  const allowedSelectors = validateMultiline(input.allowedSelectors, 'Разрешённые селекторы');
+  const blockedSelectors = validateMultiline(input.blockedSelectors, 'Запрещённые селекторы');
+  const blockedActionWords = validateMultiline(input.blockedActionWords, 'Запрещённые слова', 200, 100);
+  const copyServerAddressSelector = validateMultiline(
+    input.copyServerAddressSelector,
+    'Селектор кнопки копирования',
+    1,
+    500
+  );
+  if (input.copyServerAddressEnabled === true && !copyServerAddressSelector) {
+    throw new Error('Укажите селектор кнопки копирования адреса.');
+  }
+  if (input.randomActionsEnabled === true
+      && !input.autoDiscoverSafeElements
+      && !allowedSelectors
+      && (input.allowInternalNavigation === true || input.allowButtonClicks === true)
+      && input.allowScrolling !== true) {
+    throw new Error('Укажите разрешённые селекторы или включите прокрутку/автоматический поиск.');
+  }
 
   return {
     url: url.href,
     sessionCount: validateInteger(input.sessionCount, 'Количество сессий', 1, MAX_PARALLEL_SESSIONS),
-    durationSeconds: validateInteger(input.durationSeconds, 'Продолжительность', 0, 86400),
+    durationMode,
+    durationSeconds,
+    minDurationSeconds,
+    maxDurationSeconds,
     launchDelayMs: validateInteger(input.launchDelayMs, 'Задержка запуска', 0, 60000),
     navigationTimeoutMs: validateInteger(input.navigationTimeoutMs, 'Тайм-аут загрузки', 1000, 300000),
     headless: input.headless !== false,
@@ -157,7 +347,26 @@ function validateSettings(input) {
     repeatMode,
     maxCycles: validateInteger(input.maxCycles, 'Количество циклов', 1, MAX_CYCLES_PER_SLOT),
     restartDelayMs: validateInteger(input.restartDelayMs, 'Задержка перезапуска', 0, 3600000),
-    stopSlotOnError: input.stopSlotOnError === true
+    stopSlotOnError: input.stopSlotOnError === true,
+    randomActionsEnabled: input.randomActionsEnabled === true,
+    randomActionsMin,
+    randomActionsMax,
+    actionDelayMinMs,
+    actionDelayMaxMs,
+    actionTimeoutMs: validateInteger(input.actionTimeoutMs, 'Тайм-аут действия', 500, 60000),
+    maxNavigationDepth: validateInteger(input.maxNavigationDepth, 'Максимальная глубина переходов', 0, 20),
+    allowInternalNavigation: input.allowInternalNavigation === true,
+    allowButtonClicks: input.allowButtonClicks === true,
+    allowScrolling: input.allowScrolling === true,
+    allowGoBack: input.allowGoBack === true,
+    allowedSelectors,
+    blockedSelectors,
+    autoDiscoverSafeElements: input.autoDiscoverSafeElements === true,
+    blockedActionWords,
+    randomActionsSeed: validateOptionalSeed(input.randomActionsSeed),
+    copyServerAddressEnabled: input.copyServerAddressEnabled === true,
+    copyServerAddressSelector,
+    copyActionOrder: input.copyActionOrder === 'after' ? 'after' : 'before'
   };
 }
 
@@ -174,7 +383,14 @@ function calculateStatistics(run) {
     currentCycle: run.metrics.currentCycle,
     restarted: run.metrics.restarted,
     errorCycles: run.metrics.cyclesErrored,
-    cyclesPerMinute: Number((run.metrics.cyclesCompleted / elapsedMinutes).toFixed(1))
+    cyclesPerMinute: Number((run.metrics.cyclesCompleted / elapsedMinutes).toFixed(1)),
+    randomActionsTotal: run.metrics.randomActionsTotal,
+    internalNavigations: run.metrics.internalNavigations,
+    buttonClicks: run.metrics.buttonClicks,
+    scrolls: run.metrics.scrolls,
+    goBacks: run.metrics.goBacks,
+    dangerousSkipped: run.metrics.dangerousSkipped,
+    actionErrors: run.metrics.actionErrors
   };
 }
 
@@ -243,10 +459,68 @@ function recordCompletedCycle(run, outcome, loadTimeMs = null) {
   }
 }
 
+function recordDangerousSkipped(run, count) {
+  if (!Number.isInteger(count) || count <= 0) return;
+  run.metrics.dangerousSkipped += count;
+  publishStatistics(run);
+}
+
+function recordRandomAction(run, session, cycle, event) {
+  run.metrics.randomActionsTotal += 1;
+  if (event.success) {
+    if (event.type === 'navigate') run.metrics.internalNavigations += 1;
+    if (event.type === 'click') run.metrics.buttonClicks += 1;
+    if (event.type === 'scroll') run.metrics.scrolls += 1;
+    if (event.type === 'back') run.metrics.goBacks += 1;
+  } else {
+    run.metrics.actionErrors += 1;
+  }
+
+  const selector = event.selector || '—';
+  const text = event.text ? `, «${truncateText(event.text)}»` : '';
+  const actionSummary = event.success
+    ? `${event.title}: ${selector}`
+    : `Ошибка ${event.title}: ${truncateText(event.result, 90)}`;
+  updateSession(run, session, {
+    lastAction: actionSummary,
+    actionCount: session.actionCount + 1,
+    currentUrl: event.urlAfter || safeUrl(session.currentUrl)
+  });
+  run.log(
+    event.success ? 'INFO' : 'WARN',
+    `Слот ${session.slotId}, цикл ${cycle}, действие ${event.index}/${event.total}: `
+      + `${event.title} по ${selector}${text}; URL ${event.urlBefore || '—'} → ${event.urlAfter || '—'}; `
+      + `результат: ${event.result}, ${event.durationMs} мс.`
+  );
+}
+
+async function performConfiguredCopyAction(run, session, cycle, page, abortSignal, deadlineAt) {
+  const event = await performCopyServerAddressAction({
+    page,
+    settings: run.settings,
+    abortSignal,
+    deadlineAt,
+    onDangerousSkipped: (count) => recordDangerousSkipped(run, count)
+  });
+  updateSession(run, session, {
+    lastAction: event.success
+      ? 'Копирование адреса: кнопка нажата'
+      : `Копирование адреса: ${truncateText(event.result, 90)}`,
+    currentUrl: event.urlAfter || safeUrl(page.url())
+  });
+  run.log(
+    event.success ? 'INFO' : 'WARN',
+    `Слот ${session.slotId}, цикл ${cycle}: копирование адреса сервера `
+      + `${event.success ? 'выполнено' : 'пропущено'}; селектор ${event.selector || run.settings.copyServerAddressSelector}; `
+      + `результат: ${event.result}.`
+  );
+}
+
 async function runIsolatedSession(run, session, cycle, abortSignal) {
   let context = null;
   let page = null;
   const runId = `slot-${session.slotId}-cycle-${cycle}`;
+  const cycleDurationSeconds = selectCycleDurationSeconds(run.settings);
 
   if (abortSignal.aborted) return { stopped: true, error: false };
 
@@ -258,18 +532,24 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
     cycle,
     restartCount: cycle - 1,
     runId,
+    durationSeconds: cycleDurationSeconds,
+    lastAction: '',
+    actionCount: 0,
+    currentUrl: safeUrl(run.settings.url),
+    seed: null,
     status: 'Запуск',
     httpStatus: null,
     loadTimeMs: null,
     startedAt: formatDate(),
     errorText: ''
   });
-  run.log('INFO', `${runId}: запуск нового изолированного контекста.`);
+  run.log('INFO', `${runId}: запуск нового изолированного контекста на ${cycleDurationSeconds} сек.`);
 
   try {
     if (abortSignal.aborted) return { stopped: true, error: false };
 
     context = await run.browser.newContext({
+      acceptDownloads: false,
       viewport: {
         width: run.settings.viewportWidth,
         height: run.settings.viewportHeight
@@ -277,10 +557,45 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
     });
     run.contexts.add(context);
 
+    const allowedOrigin = new URL(run.settings.url).origin;
+    await context.route('**/*', async (route) => {
+      const request = route.request();
+      if (request.isNavigationRequest() && request.resourceType() === 'document') {
+        try {
+          const target = new URL(request.url());
+          if (target.origin !== allowedOrigin) {
+            recordDangerousSkipped(run, 1);
+            run.log(
+              'WARN',
+              `${runId}: заблокирован переход за пределы исходного origin: ${safeUrl(target.href) || target.origin}.`
+            );
+            await route.abort('blockedbyclient').catch(() => {});
+            return;
+          }
+        } catch {
+          await route.abort('blockedbyclient').catch(() => {});
+          return;
+        }
+      }
+      await route.continue().catch(() => {});
+    });
+
     if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
     page = await context.newPage();
     run.pages.add(page);
+    context.on('page', (openedPage) => {
+      if (openedPage !== page) {
+        recordDangerousSkipped(run, 1);
+        run.log('WARN', `${runId}: заблокировано открытие дополнительного окна.`);
+        void openedPage.close().catch(() => {});
+      }
+    });
+    page.on('download', (download) => {
+      recordDangerousSkipped(run, 1);
+      run.log('WARN', `${runId}: загрузка файла заблокирована.`);
+      void download.cancel().catch(() => {});
+    });
     updateSession(run, session, { status: 'Загрузка' });
 
     const started = performance.now();
@@ -311,11 +626,45 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
       status: 'Активно',
       httpStatus,
       loadTimeMs,
+      currentUrl: safeUrl(page.url()),
       errorText: ''
     });
     run.log('INFO', `${runId}: страница загружена за ${loadTimeMs} мс, HTTP ${httpStatus ?? 'нет ответа'}.`);
 
-    await abortableDelay(run.settings.durationSeconds * 1000, abortSignal);
+    const durationMilliseconds = process.argv.includes('--cycle-smoke-test')
+      ? 0
+      : process.argv.includes('--actions-smoke-test')
+        ? 3000
+        : cycleDurationSeconds * 1000;
+    const activeDeadline = performance.now() + durationMilliseconds;
+
+    if (run.settings.copyServerAddressEnabled && run.settings.copyActionOrder === 'before') {
+      await performConfiguredCopyAction(run, session, cycle, page, abortSignal, activeDeadline);
+    }
+
+    if (run.settings.randomActionsEnabled && performance.now() < activeDeadline) {
+      const actionSeed = generateSeed(run.settings.randomActionsSeed);
+      updateSession(run, session, { seed: actionSeed });
+      run.log('INFO', `Слот ${session.slotId}, цикл ${cycle}, seed ${actionSeed}.`);
+      await performRandomActions({
+        page,
+        settings: run.settings,
+        abortSignal,
+        seed: actionSeed,
+        deadlineAt: activeDeadline,
+        onDangerousSkipped: (count) => recordDangerousSkipped(run, count),
+        onAction: (event) => recordRandomAction(run, session, cycle, event)
+      });
+    }
+
+    if (run.settings.copyServerAddressEnabled
+        && run.settings.copyActionOrder === 'after'
+        && performance.now() < activeDeadline) {
+      await performConfiguredCopyAction(run, session, cycle, page, abortSignal, activeDeadline);
+    }
+
+    const remainingDurationMs = Math.max(0, activeDeadline - performance.now());
+    await abortableDelay(remainingDurationMs, abortSignal);
     if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
     recordCompletedCycle(run, 'success', loadTimeMs);
@@ -343,12 +692,26 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
   } finally {
     if (page) {
       run.pages.delete(page);
-      await page.close().catch(() => {});
+      await closeResourceWithin(run, page, 'страница');
     }
     if (context) {
       run.contexts.delete(context);
-      await context.close().catch(() => {});
+      await closeResourceWithin(run, context, 'контекст');
     }
+  }
+}
+
+async function closeResourceWithin(run, resource, label, timeoutMs = RESOURCE_CLOSE_TIMEOUT_MS) {
+  if (!resource || run.closingResources.has(resource)) return;
+  run.closingResources.add(resource);
+  const result = await settleWithin(
+    Promise.resolve().then(() => resource.close()),
+    timeoutMs
+  );
+  if (result.timedOut) {
+    run.log('WARN', `Закрытие ресурса «${label}» превысило ${timeoutMs} мс; продолжаю принудительную остановку.`);
+  } else if (result.error) {
+    run.log('WARN', `Не удалось мягко закрыть ресурс «${label}»: ${serializableError(result.error)}.`);
   }
 }
 
@@ -357,12 +720,30 @@ async function closeRunResources(run) {
   const contexts = [...run.contexts];
   run.pages.clear();
   run.contexts.clear();
-  await Promise.allSettled(pages.map((page) => page.close()));
-  await Promise.allSettled(contexts.map((context) => context.close()));
+
+  await Promise.all([
+    ...pages.map((page) => closeResourceWithin(run, page, 'страница')),
+    ...contexts.map((context) => closeResourceWithin(run, context, 'контекст'))
+  ]);
+
   if (run.browser) {
     const browser = run.browser;
     run.browser = null;
-    await browser.close().catch(() => {});
+    await closeResourceWithin(run, browser, 'соединение с Chromium');
+  }
+
+  if (run.browserServer) {
+    const browserServer = run.browserServer;
+    run.browserServer = null;
+    const result = await settleWithin(
+      Promise.resolve().then(() => browserServer.kill()),
+      BROWSER_KILL_TIMEOUT_MS
+    );
+    if (result.timedOut) {
+      run.log('ERROR', `Принудительное завершение Chromium превысило ${BROWSER_KILL_TIMEOUT_MS} мс.`);
+    } else if (result.error) {
+      run.log('WARN', `Chromium уже завершён или недоступен: ${serializableError(result.error)}.`);
+    }
   }
 }
 
@@ -375,7 +756,7 @@ async function executeRun(run) {
       : 'по одному циклу на слот';
     run.log('INFO', `Тест начат: ${run.settings.sessionCount} рабочих слотов, ${repeatDescription}, адрес ${run.settings.url}.`);
 
-    run.browser = await chromium.launch({
+    run.browserServer = await chromium.launchServer({
       headless: run.settings.headless,
       executablePath: resolveBrowserExecutable()
     });
@@ -384,7 +765,17 @@ async function executeRun(run) {
       markUnfinishedSessionsStopped(run);
       await closeRunResources(run);
       run.log('WARN', 'Тест остановлен до запуска рабочих слотов.');
-      send('test-stopped', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
+      return;
+    }
+
+    run.browser = await chromium.connect(run.browserServer.wsEndpoint());
+
+    if (run.abortController.signal.aborted) {
+      markUnfinishedSessionsStopped(run);
+      await closeRunResources(run);
+      run.log('WARN', 'Тест остановлен до запуска рабочих слотов.');
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
       return;
     }
 
@@ -402,12 +793,20 @@ async function executeRun(run) {
 
     if (run.abortController.signal.aborted) {
       run.log('WARN', 'Тест остановлен пользователем.');
-      send('test-stopped', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
     } else {
       run.log('INFO', 'Все рабочие слоты завершены.');
-      send('test-finished', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-finished', clone(calculateStatistics(run)));
     }
   } catch (error) {
+    if (run.abortController.signal.aborted) {
+      markUnfinishedSessionsStopped(run);
+      await closeRunResources(run);
+      run.log('WARN', 'Тест остановлен пользователем во время запуска или завершения Chromium.');
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
+      return;
+    }
+
     const message = serializableError(error);
     run.abortController.abort();
     run.log('ERROR', `Критическая ошибка запуска Chromium: ${message}`);
@@ -420,14 +819,9 @@ async function executeRun(run) {
       }
     }
     await closeRunResources(run);
-    send('fatal-error', { message });
+    sendTerminal(run, 'fatal-error', { message });
   } finally {
-    if (currentRun === run) {
-      publicState.running = false;
-      publicState.sessions = clone(run.sessions);
-      publicState.statistics = calculateStatistics(run);
-      currentRun = null;
-    }
+    finishPublicRun(run);
   }
 }
 
@@ -449,6 +843,11 @@ async function startTest(_event, rawSettings) {
     cycle: 0,
     restartCount: 0,
     runId: '',
+    durationSeconds: null,
+    lastAction: '',
+    actionCount: 0,
+    currentUrl: safeUrl(validated.url),
+    seed: null,
     status: 'Ожидание',
     httpStatus: null,
     loadTimeMs: null,
@@ -459,14 +858,17 @@ async function startTest(_event, rawSettings) {
     settings: validated,
     sessions,
     browser: null,
+    browserServer: null,
     contexts: new Set(),
     pages: new Set(),
+    closingResources: new WeakSet(),
     workers: [],
     abortController: new AbortController(),
     stopping: null,
     completion: null,
     log: null,
     logPath: '',
+    terminalEventSent: false,
     startedAtPerformance: performance.now(),
     metrics: {
       cyclesStarted: 0,
@@ -476,7 +878,14 @@ async function startTest(_event, rawSettings) {
       restarted: 0,
       currentCycle: 0,
       loadTotalMs: 0,
-      loadCount: 0
+      loadCount: 0,
+      randomActionsTotal: 0,
+      internalNavigations: 0,
+      buttonClicks: 0,
+      scrolls: 0,
+      goBacks: 0,
+      dangerousSkipped: 0,
+      actionErrors: 0
     }
   };
   run.log = createLogger(run);
@@ -503,8 +912,15 @@ async function stopCurrentTest() {
     run.log('WARN', 'Получена команда остановки: новые циклы запрещены.');
     markUnfinishedSessionsStopped(run);
     await closeRunResources(run);
-    if (run.completion) await run.completion;
-    return { ok: true };
+    const completion = run.completion
+      ? await settleWithin(run.completion, STOP_COMPLETION_TIMEOUT_MS)
+      : { timedOut: false };
+    if (completion.timedOut) {
+      run.log('ERROR', `Рабочие задачи не завершились за ${STOP_COMPLETION_TIMEOUT_MS} мс; состояние принудительно освобождено.`);
+      finishPublicRun(run);
+      sendTerminal(run, 'test-stopped', clone(publicState.statistics));
+    }
+    return { ok: true, forced: completion.timedOut };
   })();
   return run.stopping;
 }
@@ -522,7 +938,9 @@ function registerIpc() {
 
 function createWindow() {
   const smokeMode = process.argv.includes('--smoke-test')
-    || process.argv.includes('--cycle-smoke-test');
+    || process.argv.includes('--cycle-smoke-test')
+    || process.argv.includes('--stop-smoke-test')
+    || process.argv.includes('--actions-smoke-test');
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 940,
@@ -590,7 +1008,7 @@ async function runCycleSmokeTest() {
       ...DEFAULT_SETTINGS,
       url: `http://127.0.0.1:${address.port}/`,
       sessionCount: 2,
-      durationSeconds: 0,
+      durationSeconds: 10,
       launchDelayMs: 0,
       repeatEnabled: true,
       repeatMode: 'limited',
@@ -619,6 +1037,129 @@ async function runCycleSmokeTest() {
   }
 }
 
+async function runStopSmokeTest() {
+  const server = http.createServer(() => {
+    // Ответ намеренно не завершается: page.goto() остаётся активным до остановки.
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const address = server.address();
+    const result = await startTest(null, {
+      ...DEFAULT_SETTINGS,
+      url: `http://127.0.0.1:${address.port}/`,
+      sessionCount: 12,
+      launchDelayMs: 0,
+      navigationTimeoutMs: 300000,
+      repeatEnabled: true,
+      repeatMode: 'unlimited'
+    });
+    if (!result.ok) throw new Error(result.error);
+
+    const loadingDeadline = performance.now() + 15000;
+    while (performance.now() < loadingDeadline
+        && currentRun
+        && !currentRun.sessions.some((session) => session.status === 'Загрузка')) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const stopStarted = performance.now();
+    const stopResult = await stopCurrentTest();
+    const stopElapsedMs = Math.round(performance.now() - stopStarted);
+    if (!stopResult.ok || currentRun || publicState.running || stopElapsedMs > 15000) {
+      throw new Error(`Некорректная остановка: ${JSON.stringify({
+        stopResult,
+        hasCurrentRun: Boolean(currentRun),
+        running: publicState.running,
+        stopElapsedMs
+      })}`);
+    }
+    console.log(`STOP_SMOKE_TEST_OK ${stopElapsedMs}ms`);
+  } catch (error) {
+    process.exitCode = 1;
+    throw error;
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    app.quit();
+  }
+}
+
+async function runActionsSmokeTest() {
+  let safeClicks = 0;
+  let dangerousClicks = 0;
+  const server = http.createServer((request, response) => {
+    if (request.url === '/safe-click') safeClicks += 1;
+    if (request.url === '/danger-click') dangerousClicks += 1;
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end(`<!doctype html>
+      <title>Actions smoke</title>
+      <button class="safe-button" type="button"
+        onclick="fetch('/safe-click'); location.href='https://example.org/outside'">Показать детали</button>
+      <button class="danger" type="button" onclick="fetch('/danger-click')">Удалить сервер</button>
+      <a class="external" href="https://example.org/outside">Внешняя ссылка</a>`);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const address = server.address();
+    const result = await startTest(null, {
+      ...DEFAULT_SETTINGS,
+      url: `http://127.0.0.1:${address.port}/`,
+      sessionCount: 1,
+      launchDelayMs: 0,
+      randomActionsEnabled: true,
+      randomActionsMin: 2,
+      randomActionsMax: 2,
+      actionDelayMinMs: 100,
+      actionDelayMaxMs: 100,
+      allowInternalNavigation: false,
+      allowButtonClicks: true,
+      allowScrolling: false,
+      allowGoBack: false,
+      allowedSelectors: '.safe-button\n.danger\n.external',
+      blockedSelectors: DEFAULT_BLOCKED_SELECTORS,
+      randomActionsSeed: 184729
+    });
+    if (!result.ok) throw new Error(result.error);
+
+    const run = currentRun;
+    await run.completion;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const statistics = publicState.statistics;
+    const session = publicState.sessions[0];
+    if (statistics.randomActionsTotal !== 2
+        || statistics.buttonClicks !== 2
+        || statistics.actionErrors !== 0
+        || statistics.dangerousSkipped < 2
+        || session.actionCount !== 2
+        || session.seed !== 184729
+        || safeClicks !== 2
+        || dangerousClicks !== 0) {
+      throw new Error(`Неожиданный результат действий: ${JSON.stringify({
+        statistics,
+        session,
+        safeClicks,
+        dangerousClicks
+      })}`);
+    }
+    console.log('ACTIONS_SMOKE_TEST_OK');
+  } catch (error) {
+    process.exitCode = 1;
+    throw error;
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    app.quit();
+  }
+}
+
 process.on('unhandledRejection', (error) => {
   const message = serializableError(error);
   console.error('Необработанная ошибка Promise:', message);
@@ -640,6 +1181,10 @@ app.whenReady().then(async () => {
   createWindow();
   if (process.argv.includes('--cycle-smoke-test')) {
     await runCycleSmokeTest();
+  } else if (process.argv.includes('--stop-smoke-test')) {
+    await runStopSmokeTest();
+  } else if (process.argv.includes('--actions-smoke-test')) {
+    await runActionsSmokeTest();
   }
 });
 

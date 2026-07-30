@@ -41,8 +41,23 @@
               <input id="sessionCount" name="sessionCount" type="number" min="1" max="50" step="1" required>
             </label>
             <label class="field">
-              <span>Длительность, сек</span>
-              <input id="durationSeconds" name="durationSeconds" type="number" min="0" max="86400" step="1" required>
+              <span>Режим длительности</span>
+              <select id="durationMode" name="durationMode">
+                <option value="fixed">Фиксированная</option>
+                <option value="range">Случайно в диапазоне</option>
+              </select>
+            </label>
+            <label class="field" id="durationFixedField">
+              <span>Длительность цикла, сек</span>
+              <input id="durationSeconds" name="durationSeconds" type="number" min="10" max="86400" step="1" required>
+            </label>
+            <label class="field" id="durationMinField" hidden>
+              <span>Минимальная длительность, сек</span>
+              <input id="minDurationSeconds" name="minDurationSeconds" type="number" min="10" max="86400" step="1" required>
+            </label>
+            <label class="field" id="durationMaxField" hidden>
+              <span>Максимальная длительность, сек</span>
+              <input id="maxDurationSeconds" name="maxDurationSeconds" type="number" min="10" max="86400" step="1" required>
             </label>
             <label class="field">
               <span>Задержка старта, мс</span>
@@ -110,6 +125,127 @@
             </div>
           </div>
 
+          <div class="random-actions-panel">
+            <div class="random-actions-primary">
+              <label class="switch-field">
+                <input id="randomActionsEnabled" name="randomActionsEnabled" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+                <span>
+                  <strong>Выполнять случайные действия</strong>
+                  <small>Только разрешённые элементы внутри исходного сайта</small>
+                </span>
+              </label>
+              <label class="switch-field compact-switch">
+                <input id="copyServerAddressEnabled" name="copyServerAddressEnabled" type="checkbox">
+                <span class="switch" aria-hidden="true"></span>
+                <span>
+                  <strong>Копировать адрес сервера</strong>
+                  <small>Нажать только явно указанную кнопку копирования</small>
+                </span>
+              </label>
+            </div>
+
+            <div class="copy-address-options" id="copyAddressOptions" hidden>
+              <label class="field">
+                <span>Селектор кнопки копирования</span>
+                <input id="copyServerAddressSelector" name="copyServerAddressSelector" type="text" maxlength="500" required>
+              </label>
+              <label class="field">
+                <span>Порядок копирования адреса</span>
+                <select id="copyActionOrder" name="copyActionOrder">
+                  <option value="before">Копировать адрес до случайных действий</option>
+                  <option value="after">Копировать адрес после случайных действий</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="random-actions-options" id="randomActionsOptions" hidden>
+              <div class="random-numeric-grid">
+                <label class="field">
+                  <span>Минимум действий за цикл</span>
+                  <input id="randomActionsMin" name="randomActionsMin" type="number" min="1" max="100" step="1" required>
+                </label>
+                <label class="field">
+                  <span>Максимум действий за цикл</span>
+                  <input id="randomActionsMax" name="randomActionsMax" type="number" min="1" max="100" step="1" required>
+                </label>
+                <label class="field">
+                  <span>Минимальная задержка, мс</span>
+                  <input id="actionDelayMinMs" name="actionDelayMinMs" type="number" min="100" max="60000" step="100" required>
+                </label>
+                <label class="field">
+                  <span>Максимальная задержка, мс</span>
+                  <input id="actionDelayMaxMs" name="actionDelayMaxMs" type="number" min="100" max="60000" step="100" required>
+                </label>
+                <label class="field">
+                  <span>Тайм-аут действия, мс</span>
+                  <input id="actionTimeoutMs" name="actionTimeoutMs" type="number" min="500" max="60000" step="100" required>
+                </label>
+                <label class="field">
+                  <span>Максимальная глубина переходов</span>
+                  <input id="maxNavigationDepth" name="maxNavigationDepth" type="number" min="0" max="20" step="1" required>
+                </label>
+                <label class="field">
+                  <span>Seed случайных действий</span>
+                  <input id="randomActionsSeed" name="randomActionsSeed" type="number" min="0" max="4294967295" step="1" placeholder="Автоматически">
+                </label>
+              </div>
+
+              <div class="random-switch-grid">
+                <label class="switch-field compact-switch">
+                  <input id="allowInternalNavigation" name="allowInternalNavigation" type="checkbox">
+                  <span class="switch" aria-hidden="true"></span>
+                  <span><strong>Разрешать переходы по разделам</strong></span>
+                </label>
+                <label class="switch-field compact-switch">
+                  <input id="allowButtonClicks" name="allowButtonClicks" type="checkbox">
+                  <span class="switch" aria-hidden="true"></span>
+                  <span><strong>Разрешать нажатия кнопок</strong></span>
+                </label>
+                <label class="switch-field compact-switch">
+                  <input id="allowScrolling" name="allowScrolling" type="checkbox">
+                  <span class="switch" aria-hidden="true"></span>
+                  <span><strong>Разрешать прокрутку страницы</strong></span>
+                </label>
+                <label class="switch-field compact-switch">
+                  <input id="allowGoBack" name="allowGoBack" type="checkbox">
+                  <span class="switch" aria-hidden="true"></span>
+                  <span><strong>Разрешать возврат назад</strong></span>
+                </label>
+                <label class="switch-field compact-switch experimental-switch">
+                  <input id="autoDiscoverSafeElements" name="autoDiscoverSafeElements" type="checkbox">
+                  <span class="switch" aria-hidden="true"></span>
+                  <span>
+                    <strong>Автоматически находить безопасные элементы</strong>
+                    <small>Экспериментально: расширяет белый список после безопасных проверок</small>
+                  </span>
+                </label>
+              </div>
+
+              <div class="experimental-warning">
+                Основной безопасный режим использует только разрешённые селекторы. Автоматический поиск выключен по умолчанию.
+              </div>
+
+              <div class="selector-grid">
+                <label class="field">
+                  <span>Разрешённые селекторы</span>
+                  <textarea id="allowedSelectors" name="allowedSelectors" rows="7" maxlength="50000" spellcheck="false"></textarea>
+                  <small>Один CSS-селектор в строке. Только эти элементы доступны в основном режиме.</small>
+                </label>
+                <label class="field">
+                  <span>Запрещённые селекторы</span>
+                  <textarea id="blockedSelectors" name="blockedSelectors" rows="7" maxlength="50000" spellcheck="false"></textarea>
+                  <small>Имеют приоритет над белым списком и автоматическим поиском.</small>
+                </label>
+                <label class="field field-wide">
+                  <span>Запрещённые слова и фразы</span>
+                  <textarea id="blockedActionWords" name="blockedActionWords" rows="5" maxlength="20000" spellcheck="false"></textarea>
+                  <small>Проверяются в тексте элемента и ARIA-label. Встроенный критический список отключить нельзя.</small>
+                </label>
+              </div>
+            </div>
+          </div>
+
           <div class="validation-message" id="validationMessage" role="alert" hidden></div>
           <div class="actions">
             <button class="button button-primary" id="startButton" type="submit">
@@ -138,6 +274,13 @@
         <article class="stat-card"><span>Остановлено слотов</span><strong id="statStopped">0</strong></article>
         <article class="stat-card"><span>Циклов в минуту</span><strong id="statCyclesPerMinute">0</strong></article>
         <article class="stat-card"><span>Средняя загрузка</span><strong><span id="statAverage">0</span> <small>мс</small></strong></article>
+        <article class="stat-card stat-success"><span>Всего случайных действий</span><strong id="statRandomActionsTotal">0</strong></article>
+        <article class="stat-card"><span>Переходов по разделам</span><strong id="statInternalNavigations">0</strong></article>
+        <article class="stat-card"><span>Нажатий кнопок</span><strong id="statButtonClicks">0</strong></article>
+        <article class="stat-card"><span>Прокруток</span><strong id="statScrolls">0</strong></article>
+        <article class="stat-card"><span>Возвратов назад</span><strong id="statGoBacks">0</strong></article>
+        <article class="stat-card"><span>Пропущено опасных элементов</span><strong id="statDangerousSkipped">0</strong></article>
+        <article class="stat-card stat-error"><span>Ошибок действий</span><strong id="statActionErrors">0</strong></article>
       </section>
 
       <section class="card table-card" aria-labelledby="sessionsTitle">
@@ -156,6 +299,11 @@
                 <th>Цикл</th>
                 <th>Идентификатор запуска</th>
                 <th>Перезапусков</th>
+                <th>Длительность цикла</th>
+                <th>Последнее действие</th>
+                <th>Количество действий</th>
+                <th>Текущий URL</th>
+                <th>Seed</th>
                 <th>Статус</th>
                 <th>HTTP-код</th>
                 <th>Загрузка</th>
@@ -164,7 +312,7 @@
               </tr>
             </thead>
             <tbody id="sessionRows">
-              <tr class="empty-row"><td colspan="9">Сессии появятся после запуска теста</td></tr>
+              <tr class="empty-row"><td colspan="14">Сессии появятся после запуска теста</td></tr>
             </tbody>
           </table>
         </div>
