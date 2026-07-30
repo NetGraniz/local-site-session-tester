@@ -38,7 +38,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -185,7 +186,8 @@ h2 {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 42px;
   border: 1px solid var(--border);
@@ -198,13 +200,15 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.15);
 }
 
 input:disabled,
-select:disabled {
+select:disabled,
+textarea:disabled {
   cursor: not-allowed;
   opacity: 0.58;
 }
@@ -251,6 +255,87 @@ select:disabled {
   border: 1px solid var(--border-soft);
   border-radius: 12px;
   background: rgba(8, 13, 22, 0.55);
+}
+
+.random-actions-panel {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid rgba(91, 140, 255, 0.22);
+  border-radius: 12px;
+  background: rgba(8, 13, 22, 0.65);
+}
+
+.random-actions-primary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.random-actions-options,
+.copy-address-options {
+  display: grid;
+  gap: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.copy-address-options {
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+}
+
+.random-numeric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 14px;
+}
+
+.random-switch-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 14px 22px;
+  padding: 15px 0;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.experimental-switch {
+  grid-column: 1 / -1;
+  max-width: 620px;
+}
+
+.experimental-warning {
+  padding: 10px 12px;
+  border: 1px solid rgba(242, 185, 75, 0.34);
+  border-radius: 9px;
+  background: rgba(242, 185, 75, 0.08);
+  color: #f3c96f;
+  font-size: 12px;
+}
+
+.selector-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.selector-grid .field-wide {
+  grid-column: 1 / -1;
+}
+
+.selector-grid textarea {
+  min-height: 122px;
+  resize: vertical;
+  font-family: Consolas, "Courier New", monospace;
+  line-height: 1.45;
+}
+
+.field > small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .repeat-primary {
@@ -350,6 +435,8 @@ select:disabled {
 
 .repeat-options[hidden],
 .infinite-warning[hidden],
+#randomActionsOptions[hidden],
+#copyAddressOptions[hidden],
 #maxCyclesField[hidden],
 #durationFixedField[hidden],
 #durationMinField[hidden],
@@ -492,7 +579,7 @@ select:disabled {
 
 table {
   width: 100%;
-  min-width: 1280px;
+  min-width: 1900px;
   border-collapse: collapse;
 }
 
@@ -538,6 +625,19 @@ tbody tr:hover {
 
 .run-id {
   color: #9fb9ff;
+  white-space: nowrap;
+}
+
+.last-action {
+  min-width: 190px;
+  max-width: 280px;
+}
+
+.current-url {
+  overflow: hidden;
+  max-width: 280px;
+  color: #9fb9ff;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -681,5 +781,13 @@ footer {
 
   .repeat-primary {
     flex-direction: column;
+  }
+
+  .random-actions-primary {
+    flex-direction: column;
+  }
+
+  .random-numeric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
