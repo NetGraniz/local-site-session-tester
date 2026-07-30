@@ -9,13 +9,22 @@ const http = require('node:http');
 const path = require('node:path');
 const { chromium } = require('playwright');
 const { abortableDelay, runWorkerSlot } = require('./lib/scheduler');
+const { selectCycleDurationSeconds, settleWithin } = require('./lib/runtime-utils');
 
 const MAX_PARALLEL_SESSIONS = 50;
 const MAX_CYCLES_PER_SLOT = 100000;
+const MIN_DURATION_SECONDS = 10;
+const MAX_DURATION_SECONDS = 86400;
+const RESOURCE_CLOSE_TIMEOUT_MS = 2000;
+const BROWSER_KILL_TIMEOUT_MS = 5000;
+const STOP_COMPLETION_TIMEOUT_MS = 10000;
 const DEFAULT_SETTINGS = Object.freeze({
   url: 'https://example.com',
   sessionCount: 5,
+  durationMode: 'fixed',
   durationSeconds: 15,
+  minDurationSeconds: 15,
+  maxDurationSeconds: 60,
   launchDelayMs: 300,
   navigationTimeoutMs: 30000,
   headless: true,
@@ -79,8 +88,22 @@ function send(channel, payload) {
   }
 }
 
+function sendTerminal(run, channel, payload) {
+  if (run.terminalEventSent) return;
+  run.terminalEventSent = true;
+  send(channel, payload);
+}
+
 function clone(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function finishPublicRun(run) {
+  if (currentRun !== run) return;
+  publicState.running = false;
+  publicState.sessions = clone(run.sessions);
+  publicState.statistics = calculateStatistics(run);
+  currentRun = null;
 }
 
 async function ensureDataDirectories() {
@@ -143,11 +166,36 @@ function validateSettings(input) {
   }
 
   const repeatMode = input.repeatMode === 'limited' ? 'limited' : 'unlimited';
+  const durationMode = input.durationMode === 'range' ? 'range' : 'fixed';
+  const durationSeconds = validateInteger(
+    input.durationSeconds,
+    'Фиксированная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  const minDurationSeconds = validateInteger(
+    input.minDurationSeconds,
+    'Минимальная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  const maxDurationSeconds = validateInteger(
+    input.maxDurationSeconds,
+    'Максимальная длительность',
+    MIN_DURATION_SECONDS,
+    MAX_DURATION_SECONDS
+  );
+  if (durationMode === 'range' && maxDurationSeconds < minDurationSeconds) {
+    throw new Error('Максимальная длительность не может быть меньше минимальной.');
+  }
 
   return {
     url: url.href,
     sessionCount: validateInteger(input.sessionCount, 'Количество сессий', 1, MAX_PARALLEL_SESSIONS),
-    durationSeconds: validateInteger(input.durationSeconds, 'Продолжительность', 0, 86400),
+    durationMode,
+    durationSeconds,
+    minDurationSeconds,
+    maxDurationSeconds,
     launchDelayMs: validateInteger(input.launchDelayMs, 'Задержка запуска', 0, 60000),
     navigationTimeoutMs: validateInteger(input.navigationTimeoutMs, 'Тайм-аут загрузки', 1000, 300000),
     headless: input.headless !== false,
@@ -247,6 +295,7 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
   let context = null;
   let page = null;
   const runId = `slot-${session.slotId}-cycle-${cycle}`;
+  const cycleDurationSeconds = selectCycleDurationSeconds(run.settings);
 
   if (abortSignal.aborted) return { stopped: true, error: false };
 
@@ -258,13 +307,14 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
     cycle,
     restartCount: cycle - 1,
     runId,
+    durationSeconds: cycleDurationSeconds,
     status: 'Запуск',
     httpStatus: null,
     loadTimeMs: null,
     startedAt: formatDate(),
     errorText: ''
   });
-  run.log('INFO', `${runId}: запуск нового изолированного контекста.`);
+  run.log('INFO', `${runId}: запуск нового изолированного контекста на ${cycleDurationSeconds} сек.`);
 
   try {
     if (abortSignal.aborted) return { stopped: true, error: false };
@@ -315,7 +365,10 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
     });
     run.log('INFO', `${runId}: страница загружена за ${loadTimeMs} мс, HTTP ${httpStatus ?? 'нет ответа'}.`);
 
-    await abortableDelay(run.settings.durationSeconds * 1000, abortSignal);
+    const durationMilliseconds = process.argv.includes('--cycle-smoke-test')
+      ? 0
+      : cycleDurationSeconds * 1000;
+    await abortableDelay(durationMilliseconds, abortSignal);
     if (abortSignal.aborted) throw new Error('Тест остановлен пользователем');
 
     recordCompletedCycle(run, 'success', loadTimeMs);
@@ -343,12 +396,26 @@ async function runIsolatedSession(run, session, cycle, abortSignal) {
   } finally {
     if (page) {
       run.pages.delete(page);
-      await page.close().catch(() => {});
+      await closeResourceWithin(run, page, 'страница');
     }
     if (context) {
       run.contexts.delete(context);
-      await context.close().catch(() => {});
+      await closeResourceWithin(run, context, 'контекст');
     }
+  }
+}
+
+async function closeResourceWithin(run, resource, label, timeoutMs = RESOURCE_CLOSE_TIMEOUT_MS) {
+  if (!resource || run.closingResources.has(resource)) return;
+  run.closingResources.add(resource);
+  const result = await settleWithin(
+    Promise.resolve().then(() => resource.close()),
+    timeoutMs
+  );
+  if (result.timedOut) {
+    run.log('WARN', `Закрытие ресурса «${label}» превысило ${timeoutMs} мс; продолжаю принудительную остановку.`);
+  } else if (result.error) {
+    run.log('WARN', `Не удалось мягко закрыть ресурс «${label}»: ${serializableError(result.error)}.`);
   }
 }
 
@@ -357,12 +424,30 @@ async function closeRunResources(run) {
   const contexts = [...run.contexts];
   run.pages.clear();
   run.contexts.clear();
-  await Promise.allSettled(pages.map((page) => page.close()));
-  await Promise.allSettled(contexts.map((context) => context.close()));
+
+  await Promise.all([
+    ...pages.map((page) => closeResourceWithin(run, page, 'страница')),
+    ...contexts.map((context) => closeResourceWithin(run, context, 'контекст'))
+  ]);
+
   if (run.browser) {
     const browser = run.browser;
     run.browser = null;
-    await browser.close().catch(() => {});
+    await closeResourceWithin(run, browser, 'соединение с Chromium');
+  }
+
+  if (run.browserServer) {
+    const browserServer = run.browserServer;
+    run.browserServer = null;
+    const result = await settleWithin(
+      Promise.resolve().then(() => browserServer.kill()),
+      BROWSER_KILL_TIMEOUT_MS
+    );
+    if (result.timedOut) {
+      run.log('ERROR', `Принудительное завершение Chromium превысило ${BROWSER_KILL_TIMEOUT_MS} мс.`);
+    } else if (result.error) {
+      run.log('WARN', `Chromium уже завершён или недоступен: ${serializableError(result.error)}.`);
+    }
   }
 }
 
@@ -375,7 +460,7 @@ async function executeRun(run) {
       : 'по одному циклу на слот';
     run.log('INFO', `Тест начат: ${run.settings.sessionCount} рабочих слотов, ${repeatDescription}, адрес ${run.settings.url}.`);
 
-    run.browser = await chromium.launch({
+    run.browserServer = await chromium.launchServer({
       headless: run.settings.headless,
       executablePath: resolveBrowserExecutable()
     });
@@ -384,7 +469,17 @@ async function executeRun(run) {
       markUnfinishedSessionsStopped(run);
       await closeRunResources(run);
       run.log('WARN', 'Тест остановлен до запуска рабочих слотов.');
-      send('test-stopped', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
+      return;
+    }
+
+    run.browser = await chromium.connect(run.browserServer.wsEndpoint());
+
+    if (run.abortController.signal.aborted) {
+      markUnfinishedSessionsStopped(run);
+      await closeRunResources(run);
+      run.log('WARN', 'Тест остановлен до запуска рабочих слотов.');
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
       return;
     }
 
@@ -402,12 +497,20 @@ async function executeRun(run) {
 
     if (run.abortController.signal.aborted) {
       run.log('WARN', 'Тест остановлен пользователем.');
-      send('test-stopped', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
     } else {
       run.log('INFO', 'Все рабочие слоты завершены.');
-      send('test-finished', clone(calculateStatistics(run)));
+      sendTerminal(run, 'test-finished', clone(calculateStatistics(run)));
     }
   } catch (error) {
+    if (run.abortController.signal.aborted) {
+      markUnfinishedSessionsStopped(run);
+      await closeRunResources(run);
+      run.log('WARN', 'Тест остановлен пользователем во время запуска или завершения Chromium.');
+      sendTerminal(run, 'test-stopped', clone(calculateStatistics(run)));
+      return;
+    }
+
     const message = serializableError(error);
     run.abortController.abort();
     run.log('ERROR', `Критическая ошибка запуска Chromium: ${message}`);
@@ -420,14 +523,9 @@ async function executeRun(run) {
       }
     }
     await closeRunResources(run);
-    send('fatal-error', { message });
+    sendTerminal(run, 'fatal-error', { message });
   } finally {
-    if (currentRun === run) {
-      publicState.running = false;
-      publicState.sessions = clone(run.sessions);
-      publicState.statistics = calculateStatistics(run);
-      currentRun = null;
-    }
+    finishPublicRun(run);
   }
 }
 
@@ -449,6 +547,7 @@ async function startTest(_event, rawSettings) {
     cycle: 0,
     restartCount: 0,
     runId: '',
+    durationSeconds: null,
     status: 'Ожидание',
     httpStatus: null,
     loadTimeMs: null,
@@ -459,14 +558,17 @@ async function startTest(_event, rawSettings) {
     settings: validated,
     sessions,
     browser: null,
+    browserServer: null,
     contexts: new Set(),
     pages: new Set(),
+    closingResources: new WeakSet(),
     workers: [],
     abortController: new AbortController(),
     stopping: null,
     completion: null,
     log: null,
     logPath: '',
+    terminalEventSent: false,
     startedAtPerformance: performance.now(),
     metrics: {
       cyclesStarted: 0,
@@ -503,8 +605,15 @@ async function stopCurrentTest() {
     run.log('WARN', 'Получена команда остановки: новые циклы запрещены.');
     markUnfinishedSessionsStopped(run);
     await closeRunResources(run);
-    if (run.completion) await run.completion;
-    return { ok: true };
+    const completion = run.completion
+      ? await settleWithin(run.completion, STOP_COMPLETION_TIMEOUT_MS)
+      : { timedOut: false };
+    if (completion.timedOut) {
+      run.log('ERROR', `Рабочие задачи не завершились за ${STOP_COMPLETION_TIMEOUT_MS} мс; состояние принудительно освобождено.`);
+      finishPublicRun(run);
+      sendTerminal(run, 'test-stopped', clone(publicState.statistics));
+    }
+    return { ok: true, forced: completion.timedOut };
   })();
   return run.stopping;
 }
@@ -522,7 +631,8 @@ function registerIpc() {
 
 function createWindow() {
   const smokeMode = process.argv.includes('--smoke-test')
-    || process.argv.includes('--cycle-smoke-test');
+    || process.argv.includes('--cycle-smoke-test')
+    || process.argv.includes('--stop-smoke-test');
   mainWindow = new BrowserWindow({
     width: 1480,
     height: 940,
@@ -590,7 +700,7 @@ async function runCycleSmokeTest() {
       ...DEFAULT_SETTINGS,
       url: `http://127.0.0.1:${address.port}/`,
       sessionCount: 2,
-      durationSeconds: 0,
+      durationSeconds: 10,
       launchDelayMs: 0,
       repeatEnabled: true,
       repeatMode: 'limited',
@@ -619,6 +729,57 @@ async function runCycleSmokeTest() {
   }
 }
 
+async function runStopSmokeTest() {
+  const server = http.createServer(() => {
+    // Ответ намеренно не завершается: page.goto() остаётся активным до остановки.
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  try {
+    const address = server.address();
+    const result = await startTest(null, {
+      ...DEFAULT_SETTINGS,
+      url: `http://127.0.0.1:${address.port}/`,
+      sessionCount: 12,
+      launchDelayMs: 0,
+      navigationTimeoutMs: 300000,
+      repeatEnabled: true,
+      repeatMode: 'unlimited'
+    });
+    if (!result.ok) throw new Error(result.error);
+
+    const loadingDeadline = performance.now() + 15000;
+    while (performance.now() < loadingDeadline
+        && currentRun
+        && !currentRun.sessions.some((session) => session.status === 'Загрузка')) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const stopStarted = performance.now();
+    const stopResult = await stopCurrentTest();
+    const stopElapsedMs = Math.round(performance.now() - stopStarted);
+    if (!stopResult.ok || currentRun || publicState.running || stopElapsedMs > 15000) {
+      throw new Error(`Некорректная остановка: ${JSON.stringify({
+        stopResult,
+        hasCurrentRun: Boolean(currentRun),
+        running: publicState.running,
+        stopElapsedMs
+      })}`);
+    }
+    console.log(`STOP_SMOKE_TEST_OK ${stopElapsedMs}ms`);
+  } catch (error) {
+    process.exitCode = 1;
+    throw error;
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    app.quit();
+  }
+}
+
 process.on('unhandledRejection', (error) => {
   const message = serializableError(error);
   console.error('Необработанная ошибка Promise:', message);
@@ -640,6 +801,8 @@ app.whenReady().then(async () => {
   createWindow();
   if (process.argv.includes('--cycle-smoke-test')) {
     await runCycleSmokeTest();
+  } else if (process.argv.includes('--stop-smoke-test')) {
+    await runStopSmokeTest();
   }
 });
 

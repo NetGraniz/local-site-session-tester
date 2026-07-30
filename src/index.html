@@ -41,8 +41,23 @@
               <input id="sessionCount" name="sessionCount" type="number" min="1" max="50" step="1" required>
             </label>
             <label class="field">
-              <span>Длительность, сек</span>
-              <input id="durationSeconds" name="durationSeconds" type="number" min="0" max="86400" step="1" required>
+              <span>Режим длительности</span>
+              <select id="durationMode" name="durationMode">
+                <option value="fixed">Фиксированная</option>
+                <option value="range">Случайно в диапазоне</option>
+              </select>
+            </label>
+            <label class="field" id="durationFixedField">
+              <span>Длительность цикла, сек</span>
+              <input id="durationSeconds" name="durationSeconds" type="number" min="10" max="86400" step="1" required>
+            </label>
+            <label class="field" id="durationMinField" hidden>
+              <span>Минимальная длительность, сек</span>
+              <input id="minDurationSeconds" name="minDurationSeconds" type="number" min="10" max="86400" step="1" required>
+            </label>
+            <label class="field" id="durationMaxField" hidden>
+              <span>Максимальная длительность, сек</span>
+              <input id="maxDurationSeconds" name="maxDurationSeconds" type="number" min="10" max="86400" step="1" required>
             </label>
             <label class="field">
               <span>Задержка старта, мс</span>
@@ -156,6 +171,7 @@
                 <th>Цикл</th>
                 <th>Идентификатор запуска</th>
                 <th>Перезапусков</th>
+                <th>Длительность цикла</th>
                 <th>Статус</th>
                 <th>HTTP-код</th>
                 <th>Загрузка</th>
@@ -164,7 +180,7 @@
               </tr>
             </thead>
             <tbody id="sessionRows">
-              <tr class="empty-row"><td colspan="9">Сессии появятся после запуска теста</td></tr>
+              <tr class="empty-row"><td colspan="10">Сессии появятся после запуска теста</td></tr>
             </tbody>
           </table>
         </div>

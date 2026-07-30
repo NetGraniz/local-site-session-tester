@@ -350,7 +350,10 @@ select:disabled {
 
 .repeat-options[hidden],
 .infinite-warning[hidden],
-#maxCyclesField[hidden] {
+#maxCyclesField[hidden],
+#durationFixedField[hidden],
+#durationMinField[hidden],
+#durationMaxField[hidden] {
   display: none;
 }
 

@@ -15,6 +15,9 @@ const logOutput = document.querySelector('#logOutput');
 const repeatOptions = document.querySelector('#repeatOptions');
 const maxCyclesField = document.querySelector('#maxCyclesField');
 const infiniteWarning = document.querySelector('#infiniteWarning');
+const durationFixedField = document.querySelector('#durationFixedField');
+const durationMinField = document.querySelector('#durationMinField');
+const durationMaxField = document.querySelector('#durationMaxField');
 const fields = [...form.querySelectorAll('input, select')];
 
 let isRunning = false;
@@ -22,7 +25,10 @@ let isRunning = false;
 const elements = {
   url: document.querySelector('#url'),
   sessionCount: document.querySelector('#sessionCount'),
+  durationMode: document.querySelector('#durationMode'),
   durationSeconds: document.querySelector('#durationSeconds'),
+  minDurationSeconds: document.querySelector('#minDurationSeconds'),
+  maxDurationSeconds: document.querySelector('#maxDurationSeconds'),
   launchDelayMs: document.querySelector('#launchDelayMs'),
   navigationTimeoutMs: document.querySelector('#navigationTimeoutMs'),
   headless: document.querySelector('#headless'),
@@ -51,6 +57,19 @@ const statElements = {
 
 const sessions = new Map();
 
+function updateDurationControls() {
+  const rangeMode = elements.durationMode.value === 'range';
+  durationFixedField.hidden = rangeMode;
+  durationMinField.hidden = !rangeMode;
+  durationMaxField.hidden = !rangeMode;
+
+  if (!isRunning) {
+    elements.durationSeconds.disabled = rangeMode;
+    elements.minDurationSeconds.disabled = !rangeMode;
+    elements.maxDurationSeconds.disabled = !rangeMode;
+  }
+}
+
 function updateRepeatControls() {
   const repeatEnabled = elements.repeatEnabled.checked;
   const limited = repeatEnabled && elements.repeatMode.value === 'limited';
@@ -75,7 +94,10 @@ function setRunning(running, label) {
   stopButton.disabled = !running;
   runState.classList.toggle('is-active', running);
   runStateText.textContent = label || (running ? 'Тест выполняется' : 'Готово к запуску');
-  if (!running) updateRepeatControls();
+  if (!running) {
+    updateDurationControls();
+    updateRepeatControls();
+  }
 }
 
 function showValidation(message) {
@@ -93,6 +115,7 @@ function populateSettings(settings) {
       element.value = settings[key] ?? '';
     }
   }
+  updateDurationControls();
   updateRepeatControls();
 }
 
@@ -100,7 +123,10 @@ function collectSettings() {
   return {
     url: elements.url.value.trim(),
     sessionCount: Number(elements.sessionCount.value),
+    durationMode: elements.durationMode.value,
     durationSeconds: Number(elements.durationSeconds.value),
+    minDurationSeconds: Number(elements.minDurationSeconds.value),
+    maxDurationSeconds: Number(elements.maxDurationSeconds.value),
     launchDelayMs: Number(elements.launchDelayMs.value),
     navigationTimeoutMs: Number(elements.navigationTimeoutMs.value),
     headless: elements.headless.value === 'true',
@@ -127,6 +153,9 @@ function validateLocally(settings) {
   if (!form.checkValidity()) {
     form.reportValidity();
     return 'Проверьте числовые параметры теста.';
+  }
+  if (settings.durationMode === 'range' && settings.maxDurationSeconds < settings.minDurationSeconds) {
+    return 'Максимальная длительность не может быть меньше минимальной.';
   }
   if (settings.repeatEnabled && settings.repeatMode === 'limited'
       && (!Number.isInteger(settings.maxCycles) || settings.maxCycles < 1 || settings.maxCycles > 100000)) {
@@ -164,7 +193,7 @@ function renderSessions() {
     const row = document.createElement('tr');
     row.className = 'empty-row';
     const cell = createCell('Сессии появятся после запуска теста');
-    cell.colSpan = 9;
+    cell.colSpan = 10;
     row.append(cell);
     sessionRows.append(row);
     return;
@@ -183,6 +212,7 @@ function renderSessions() {
       createCell(session.cycle || '—', 'mono'),
       createCell(session.runId || '—', 'mono run-id'),
       createCell(String(session.restartCount || 0), 'mono'),
+      createCell(session.durationSeconds ? `${session.durationSeconds} сек` : '—', 'mono'),
       statusCell,
       createCell(session.httpStatus ?? '—', 'mono'),
       createCell(session.loadTimeMs === null ? '—' : `${session.loadTimeMs} мс`, 'mono'),
@@ -282,6 +312,7 @@ openLogsButton.addEventListener('click', async () => {
 
 elements.repeatEnabled.addEventListener('change', updateRepeatControls);
 elements.repeatMode.addEventListener('change', updateRepeatControls);
+elements.durationMode.addEventListener('change', updateDurationControls);
 
 api.on('test-started', (state) => {
   sessions.clear();
