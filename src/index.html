@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <title>Local Site Visitor</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Локальный стенд тестирования</p>
+          <h1>Local Site Visitor</h1>
+          <p class="subtitle">Параллельные изолированные браузерные сессии для разрешённых сайтов</p>
+        </div>
+        <div class="run-state" id="runState">
+          <span class="pulse" aria-hidden="true"></span>
+          <span id="runStateText">Готово к запуску</span>
+        </div>
+      </header>
+
+      <section class="card setup-card" aria-labelledby="settingsTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">Конфигурация</p>
+            <h2 id="settingsTitle">Параметры теста</h2>
+          </div>
+          <p class="hint">До 50 независимых контекстов Chromium</p>
+        </div>
+
+        <form id="testForm" novalidate>
+          <div class="form-grid">
+            <label class="field field-wide">
+              <span>URL сайта</span>
+              <input id="url" name="url" type="url" required spellcheck="false" placeholder="https://example.com">
+            </label>
+            <label class="field">
+              <span>Сессий</span>
+              <input id="sessionCount" name="sessionCount" type="number" min="1" max="50" step="1" required>
+            </label>
+            <label class="field">
+              <span>Длительность, сек</span>
+              <input id="durationSeconds" name="durationSeconds" type="number" min="0" max="86400" step="1" required>
+            </label>
+            <label class="field">
+              <span>Задержка старта, мс</span>
+              <input id="launchDelayMs" name="launchDelayMs" type="number" min="0" max="60000" step="1" required>
+            </label>
+            <label class="field">
+              <span>Тайм-аут загрузки, мс</span>
+              <input id="navigationTimeoutMs" name="navigationTimeoutMs" type="number" min="1000" max="300000" step="1000" required>
+            </label>
+            <label class="field">
+              <span>Режим браузера</span>
+              <select id="headless" name="headless">
+                <option value="true">Фоновый</option>
+                <option value="false">Видимый</option>
+              </select>
+            </label>
+            <fieldset class="field viewport-field">
+              <legend>Размер окна</legend>
+              <div class="viewport-inputs">
+                <input id="viewportWidth" name="viewportWidth" type="number" min="320" max="7680" step="1" aria-label="Ширина окна" required>
+                <span>×</span>
+                <input id="viewportHeight" name="viewportHeight" type="number" min="240" max="4320" step="1" aria-label="Высота окна" required>
+              </div>
+            </fieldset>
+          </div>
+
+          <div class="validation-message" id="validationMessage" role="alert" hidden></div>
+          <div class="actions">
+            <button class="button button-primary" id="startButton" type="submit">
+              <span class="button-icon">▶</span>
+              Запустить
+            </button>
+            <button class="button button-danger" id="stopButton" type="button" disabled>
+              <span class="button-icon">■</span>
+              Остановить
+            </button>
+            <button class="button button-muted" id="clearLogButton" type="button">Очистить журнал</button>
+            <button class="button button-muted" id="openLogsButton" type="button">Открыть папку журналов</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="statistics-grid" aria-label="Статистика теста">
+        <article class="stat-card"><span>Запланировано</span><strong id="statPlanned">0</strong></article>
+        <article class="stat-card"><span>Запущено</span><strong id="statStarted">0</strong></article>
+        <article class="stat-card stat-active"><span>Активно</span><strong id="statActive">0</strong></article>
+        <article class="stat-card stat-success"><span>Завершено</span><strong id="statCompleted">0</strong></article>
+        <article class="stat-card stat-error"><span>Ошибок</span><strong id="statErrors">0</strong></article>
+        <article class="stat-card"><span>Остановлено</span><strong id="statStopped">0</strong></article>
+        <article class="stat-card stat-wide"><span>Средняя загрузка</span><strong><span id="statAverage">0</span> <small>мс</small></strong></article>
+      </section>
+
+      <section class="card table-card" aria-labelledby="sessionsTitle">
+        <div class="section-heading compact">
+          <div>
+            <p class="section-kicker">Мониторинг</p>
+            <h2 id="sessionsTitle">Текущие сессии</h2>
+          </div>
+          <span class="record-count" id="recordCount">0 записей</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>№</th>
+                <th>Статус</th>
+                <th>HTTP-код</th>
+                <th>Загрузка</th>
+                <th>Время запуска</th>
+                <th>Текст ошибки</th>
+              </tr>
+            </thead>
+            <tbody id="sessionRows">
+              <tr class="empty-row"><td colspan="6">Сессии появятся после запуска теста</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card log-card" aria-labelledby="logTitle">
+        <div class="section-heading compact">
+          <div>
+            <p class="section-kicker">Диагностика</p>
+            <h2 id="logTitle">Журнал событий</h2>
+          </div>
+          <span class="live-label"><span></span> в реальном времени</span>
+        </div>
+        <div class="log-output" id="logOutput" role="log" aria-live="polite">
+          <p class="log-placeholder">Журнал готов к работе.</p>
+        </div>
+      </section>
+
+      <footer>
+        Используйте только для сайтов, которыми вы владеете или на тестирование которых имеете разрешение.
+      </footer>
+    </main>
+    <script src="renderer.js"></script>
+  </body>
+</html>

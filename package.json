@@ -1,0 +1,76 @@
+{
+  "name": "local-site-visitor",
+  "version": "1.0.0",
+  "description": "Локальное Windows-приложение для контролируемого тестирования сайта в изолированных браузерных сессиях",
+  "main": "main.js",
+  "author": "Local Site Visitor",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "install-browser": "set PLAYWRIGHT_BROWSERS_PATH=0&& playwright install chromium",
+    "postinstall": "set PLAYWRIGHT_BROWSERS_PATH=0&& playwright install chromium",
+    "check": "node --check main.js && node --check preload.js && node --check src/renderer.js",
+    "test:browser": "node scripts/self-test.js",
+    "smoke": "electron . --smoke-test",
+    "dist:win": "electron-builder --win nsis --x64",
+    "pack:win": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
+  },
+  "devDependencies": {
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "ru.localsitevisitor.app",
+    "productName": "Local Site Visitor",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/playwright-core/.local-browsers/**/*"
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "assets/icon.ico",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-${arch}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Local Site Visitor",
+      "installerLanguages": [
+        "ru_RU"
+      ],
+      "language": "1049"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-${arch}-portable.${ext}"
+    }
+  }
+}
